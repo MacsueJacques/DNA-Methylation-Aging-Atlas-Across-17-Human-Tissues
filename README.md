@@ -1,4 +1,4 @@
-<img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/cff071b8-4bfa-49f2-b840-9324aee7aea2" />DNA Methylation Ageing Atlas
+DNA Methylation Ageing Atlas Across 17 Human Tissues
 
 This repository hosts the codebase developed for the DNA methylation ageing atlas project. The project integrates multi-tissue, multi-cohort DNA methylation data to map how ageing is reflected in the methylome and to uncover mechanisms, biomarkers, and targets with translational potential.
 
