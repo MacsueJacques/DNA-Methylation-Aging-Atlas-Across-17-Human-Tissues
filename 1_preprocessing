@@ -1,0 +1,15 @@
+DNA Methylation Ageing Atlas – Preprocessing Code
+
+This repository contains example code and workflows used in the DNA methylation ageing atlas project. The scripts demonstrate key steps in data preprocessing, curation, and quality control, covering both open-access datasets and collaborator-contributed data.
+
+The goal of this repository is to provide a transparent and reproducible framework for preparing DNA methylation data prior to downstream analyses. The code highlights approaches for:
+
+Cleaning and harmonizing data from multiple sources
+
+Filtering and quality assessment of CpG sites and samples
+
+Normalization and batch correction strategies
+
+Metadata integration and annotation for ageing-focused analyses
+
+While the data itself is not included, these examples serve as a guide for researchers interested in applying similar methods to their own datasets or in reproducing aspects of the ageing atlas study.
