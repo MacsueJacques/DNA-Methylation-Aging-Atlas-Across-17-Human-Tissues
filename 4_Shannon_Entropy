@@ -1,0 +1,257 @@
+#Shannon Entropy
+
+####Example 1####
+#### Entropy ####
+setwd("Datasets/Kidney/GSE.....")
+library(limma)
+library(minfi)      
+library(tidyverse)  
+
+#run limma and adjust for confounders EXCLUDING age
+design=model.matrix(~Sex+
+                      ethnicity,
+                    pheno)
+library(limma)
+fit1 <- lmFit(M,
+              design)
+fit2 <- eBayes(fit1)
+
+resid_M <- residuals(fit2, M)
+
+#add the mean beta value for each cpg to the residuals to get a beta matrix 
+M_adj <- resid_M + rowMeans(M)
+B_adj <- ilogit2(M_adj)
+plotDensities(B_adj, legend = F)
+
+#calcuate entropy 
+calculate_entropy <- function(B){
+  return(sum(B*log2(B) + (1-B)*log2(1-B), na.rm=T)/(length(B)*log2(1/2)))
+}
+
+Entropy <- apply(B_adj, 2, calculate_entropy)
+Entropy <- as.data.frame(Entropy)
+Entropy$Basename <- rownames(Entropy)
+pheno <- left_join(pheno, Entropy, by ="Basename")
+
+#Save entropy plot
+tiff('GSE......_Entropy.tiff',
+     width =5,
+     height = 3,
+     units = 'in',
+     res = 200)
+ggplot(data = pheno, aes(x = age, y = Entropy)) +
+  geom_jitter(colour = "deepskyblue4") +
+  geom_smooth(method = "lm", colour = "black") +
+  labs(title = "GSE...... Entropy",
+       ylab = "entropy")+
+  theme_minimal() 
+dev.off()
+
+
+fit <- lm(Entropy ~ age, pheno)
+summary(fit)
+pval = summary(fit)$coefficients[,4][2]
+pval
+#0.2849155      
+effect = summary(fit)$coefficients[,1][2]
+effect
+#effect: 8.190519e-05  
+stderr = summary(fit)$coefficients[,2][2]
+stderr
+#stderr = 7.517862e-05 
+
+write.csv(Entropy, "GSE......_Entropy.csv")
+
+#### Example 2 ####
+setwd("Datasets/Lung/GSE......")
+library(limma)
+library(minfi)      
+library(tidyverse)  
+
+#run limma and adjust for confounders EXCLUDING age
+
+design = model.matrix(~ Sex,
+                      pheno)
+
+fit1 <- lmFit(M,
+              design)
+fit2 <- eBayes(fit1)
+
+resid_M <- residuals(fit2, M)
+
+#add the mean beta value for each cpg to the residuals to get a beta matrix 
+
+M_adj <- resid_M + rowMeans(M)
+B_adj <- ilogit2(M_adj)
+plotDensities(B_adj, legend = F)
+
+#calcuate entropy 
+calculate_entropy <- function(B){
+  return(sum(B*log2(B) + (1-B)*log2(1-B), na.rm=T)/(length(B)*log2(1/2)))
+}
+
+Entropy <- apply(B_adj, 2, calculate_entropy)
+Entropy <- as.data.frame(Entropy)
+Entropy$Sample_Name <- rownames(Entropy)
+pheno <- left_join(pheno, Entropy, by =c("Sample_Name"="Sample_Name"))
+
+#Save entropy plot
+tiff('GSE......_Entropy.tiff',
+     width =5,
+     height = 3,
+     units = 'in',
+     res = 200)
+ggplot(data = pheno, aes(x = age, y = Entropy)) +
+  geom_jitter(colour = "deepskyblue4") +
+  geom_smooth(method = "lm", colour = "black") +
+  labs(title = "GSE...... Entropy",
+       ylab = "entropy")+
+  theme_minimal() 
+dev.off()
+
+fit <- lm(Entropy ~ age, pheno)
+summary(fit)
+pval = summary(fit)$coefficients[,4][2]
+pval
+#0.2245742         
+effect = summary(fit)$coefficients[,1][2]
+effect
+#effect: 0.0004584969 
+stderr = summary(fit)$coefficients[,2][2]
+stderr
+#stderr = 0.0003691886  
+
+write.csv(Entropy, "GSE......_Entropy.csv")
+
+range(pheno$`subject age`)
+mean(pheno$`subject age`)
+sd(pheno$`subject age`)
+
+#Entropy on all age-related cpgs
+DMPs <- read.csv("Lung/Meta-analysis/DMPs/Lung_DMPs.csv")
+VMPs <- read.csv("Lung/Meta-analysis/VMPs/Lung_VMPs.csv")
+All_cps <- full_join(DMPs, VMPs, by = "MarkerName")
+All_cps <- All_cps$MarkerName
+
+B <- as.data.frame(B)
+B_all <- B[rownames(B) %in% All_cps,]
+M_all <- logit2(B_all)
+
+#run limma and adjust for confounders EXCLUDING age
+fit1_M <- lmFit(M_all,
+                design)
+fit2 <- eBayes(fit1_M)
+resid_M <- residuals(fit2, M_all)
+#add the mean beta value for each cpg to the residuals to get a beta matrix 
+
+M_adj <- resid_M + rowMeans(M_all)
+B_adj <- ilogit2(M_adj)
+plotDensities(B_adj, legend = F)
+
+#calcuate entropy 
+calculate_entropy <- function(B){
+  return(sum(B*log2(B) + (1-B)*log2(1-B))/(length(B)*log2(1/2)))
+}
+
+Entropy_all <- apply(B_adj, 2, calculate_entropy)
+Entropy_all <- as.data.frame(Entropy_all)
+Entropy_all$geo_accession <- rownames(Entropy_all)
+pheno <- left_join(pheno, Entropy_all, by = "geo_accession")
+
+
+ggplot(data = pheno, aes(x = age, y = Entropy_all)) +
+  geom_jitter(colour = "deepskyblue4") +
+  geom_smooth(method = "lm", colour = "black") +
+  labs(title = "GSE...... Entropy all age-related CpGs",
+       ylab = "entropy")+
+  theme_minimal()
+
+#summary statistics all 
+fit <- lm(Entropy_all ~ age, pheno)
+summary(fit)
+pval = summary(fit)$coefficients[,4][2]
+pval
+#p-value: 0.9892235                     
+effect = summary(fit)$coefficients[,1][2]
+effect
+#effect: 5.497657e-07             
+stderr = summary(fit)$coefficients[,2][2]
+stderr
+#stderr: 4.0298e-05   
+
+#calculate entropy on cpgs that do not change with age 
+
+B_none <- B[!rownames(B) %in% All_cps,]
+M_none <- logit2(B_none)
+
+fit1 <- lmFit(M_none,
+              design)
+fit2 <- eBayes(fit1)
+
+resid_M <- residuals(fit2, M_none)
+
+#add the mean beta value for each cpg to the residuals to get a beta matrix 
+
+M_adj <- resid_M + rowMeans(M_none)
+B_adj <- ilogit2(M_adj)
+plotDensities(B_adj, legend = F)
+
+#calcuate entropy 
+calculate_entropy <- function(B){
+  return(sum(B*log2(B) + (1-B)*log2(1-B))/(length(B)*log2(1/2)))
+}
+
+Entropy_none <- apply(B_adj, 2, calculate_entropy)
+Entropy_none <- as.data.frame(Entropy_none)
+Entropy_none$geo_accession <- rownames(Entropy_none)
+pheno <- left_join(pheno, Entropy_none, by = "geo_accession")
+
+ggplot(data = pheno, aes(x = age, y = Entropy_none)) +
+  geom_jitter(colour = "deepskyblue4") +
+  geom_smooth(method = "lm", colour = "black") +
+  labs(title = "GSE...... Entropy all non-age-related CpGs",
+       ylab = "entropy")+
+  theme_minimal()
+
+pheno_entropy <- pheno %>% select(geo_accession, age, Entropy_all, Entropy_none)
+
+pheno_entropy <- pheno_entropy %>% pivot_longer(!c(age,geo_accession),
+                                                names_to = "Entropy type",
+                                                values_to = "Entropy value")
+
+names(pheno_entropy)[names(pheno_entropy) == "Entropy type"] <- "Condition"
+
+library(viridis)
+tiff('GSE...... Entropy all age-related CpGs vs non-age-related CpGs.tiff',
+     width =10,
+     height = 5,
+     units = 'in',
+     res = 400)
+#pheno_entropy <- pheno_entropy %>% mutate(Class = factor(Class, levels = c("Entropy_VMPs","Entropy_DMPs","Entropy")))
+ggplot(pheno_entropy, aes(x = age, y = `Entropy value`))+ 
+  geom_jitter(aes(colour = Condition, alpha = 0.8)) +
+  geom_smooth(aes(colour = Condition), method = "lm")+ 
+  scale_color_viridis(discrete = TRUE, option = "D")+
+  scale_fill_viridis(discrete = TRUE) +
+  theme_minimal()
+dev.off()
+
+
+#summary statistics non-age-related cpgs
+fit <- lm(Entropy_none ~ age, pheno)
+summary(fit)
+pval = summary(fit)$coefficients[,4][2]
+pval
+#p-value: 0.7913006                       
+effect = summary(fit)$coefficients[,1][2]
+effect
+#effect: 1.31775e-05    
+stderr = summary(fit)$coefficients[,2][2]
+stderr
+#stderr: 4.926697e-05   
+
+
+write.table(pheno, "GSE......_phenotypes.txt",
+            sep = "\t",
+            col.names = TRUE)
+
