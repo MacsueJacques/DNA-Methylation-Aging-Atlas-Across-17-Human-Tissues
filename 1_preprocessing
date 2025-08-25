@@ -1,15 +1,572 @@
-DNA Methylation Ageing Atlas – Preprocessing Code
+#DNA Methylation Ageing Atlas – Preprocessing Code
 
-This repository contains example code and workflows used in the DNA methylation ageing atlas project. The scripts demonstrate key steps in data preprocessing, curation, and quality control, covering both open-access datasets and collaborator-contributed data.
+####Example 1####
+#Get the GEO dataset
+library(tidyverse)
+library(GEOquery)
+setwd("your_directory")
+data <- getGEO("GSE......",
+               destdir = getwd(),
+               GSEMatrix = FALSE,
+               AnnotGPL = FALSE,
+               getGPL = FALSE)
+GSM_IDs <- data@header$sample_id
 
-The goal of this repository is to provide a transparent and reproducible framework for preparing DNA methylation data prior to downstream analyses. The code highlights approaches for:
+library(GEOquery)
+pheno <- rbind()
+for (g in GSM_IDs)
+{
+  data <- getGEO(g,
+                 destdir = getwd(),
+                 GSEMatrix = TRUE,
+                 AnnotGPL = FALSE,
+                 getGPL = FALSE)
+  
+  pheno <- rbind(pheno,
+                 data@header$characteristics_ch1)
+}
 
-Cleaning and harmonizing data from multiple sources
+test <- pheno
+colnames <- as.character(sapply(test[1,],
+                                str_extract,
+                                pattern = ".*(?=:)"))
+colnames(test) <- colnames
+test <- test %>%
+  as_tibble%>%
+  mutate_all(str_extract,
+             pattern = "(?<=:[[:blank:]]).*")%>%
+  mutate(`GEO accession` = GSM_IDs,
+         Sample_Name = GSM_IDs)
 
-Filtering and quality assessment of CpG sites and samples
+#Load raw data
+raw_heading <- read.table("......._non_normalized.txt.gz",
+                          nrows = 1)
+raw <- read_delim("........._non_normalized.txt.gz",
+                  skip = 1,
+                  col_names = FALSE)
+CpGs <- pull(raw,
+             var=1)
 
-Normalization and batch correction strategies
+#Obtain Sentrix ID and Sentrix Position from column names
+names <- raw_heading[grep("Signal_A",raw_heading)]
+Sentrix_ID <- str_extract(names,
+                          "^[^_:]+")
+Sentrix_Position <- str_extract(names,
+                                "(?<=_).*?(?=\\.)")
 
-Metadata integration and annotation for ageing-focused analyses
+#Add sample name to merge with matrices
+test <- test %>%
+    mutate(Sentrix_ID = Sentrix_ID,
+           Sentrix_Position = Sentrix_Position)
 
-While the data itself is not included, these examples serve as a guide for researchers interested in applying similar methods to their own datasets or in reproducing aspects of the ageing atlas study.
+write_csv(test,
+          file = "GSE..... phenotypes with bad samples.csv")
+
+#Extract meth, unmeth and detP signals
+meth <- raw[,seq(3,ncol(raw),by=3)] %>% as.matrix()
+rownames(meth) <- CpGs
+colnames(meth) <- test$`GEO accession`
+unmeth <- raw[,seq(2,ncol(raw),by=3)] %>% as.matrix()
+rownames(unmeth) <- CpGs
+colnames(unmeth) <- test$`GEO accession`
+detP <- raw[,seq(4,ncol(raw),by=3)] %>% as.matrix()
+rownames(detP) <- CpGs
+colnames(detP) <- test$`GEO accession`
+
+#Now put data into an methylset object
+library(minfi)
+annotation <- c("IlluminaHumanMethylation27k","ilmn12.hg19")
+names(annotation) <- c("array","annotation")
+methylset=MethylSet(Meth=meth,
+                    Unmeth=unmeth,
+                    annotation = annotation)
+RSet <- ratioConvert(methylset,
+                     what = "both",
+                     keepCN = TRUE)
+
+#Preprocess myself as I have enough info to do that
+test <- test %>%
+    mutate_at(vars(gender:`disease state`,
+                   `GEO accession`:Sentrix_Position),
+              as.factor) %>%
+    mutate_at(vars(age),
+              as.numeric)
+
+#Remove samples with > 10% of probes with detection p-value > 0.01
+filter=function(v)
+{
+    thresh=0.1*length(v)
+    if (length(which(v>0.01))<thresh)
+        return("OK")
+    else
+        return("Bad sample")
+}
+apply(detP,2,filter) #One sample failed QC (GSM611998)
+meth <- meth[,-which(test$`GEO accession`=="GSM611998")]
+unmeth <- unmeth[,-which(test$`GEO accession`=="GSM611998")]
+detP <- detP[,-which(test$`GEO accession`=="GSM611998")]
+methylset=MethylSet(Meth=meth,
+                    Unmeth=unmeth,
+                    annotation = annotation)
+RSet <- ratioConvert(methylset,
+                     what = "both",
+                     keepCN = TRUE)
+test <- test[-which(test$`GEO accession`=="GSM611998"),]
+    
+write_csv(test,
+          file = "GSE...... phenotypes.csv")
+
+#Probe filtering (no missing probes so far)
+filter2=function(v)
+{
+    thresh=ceiling(0.05*nrow(test)) #5% of samples
+    if (length(which(v>0.01))<thresh)
+        return("OK")
+    else
+        return("Bad probe")
+}
+p=apply(detP,1,filter2)
+length(which(p=="Bad probe"))  #2202 probes did not pass QC
+CpGs_tokeep=setdiff(CpGs,CpGs[which(p=="Bad probe")])
+
+#Remove probes with general SNP list
+library(ChAMP)
+data(EPIC.manifest.pop.hg19)
+maskname <- rownames(EPIC.manifest.pop.hg19)[which(EPIC.manifest.pop.hg19$MASK_general_EUR == 
+                                                       TRUE)]
+CpGs_SNPs=intersect(CpGs_tokeep,maskname)
+CpGs_tokeep=setdiff(CpGs_tokeep,CpGs_SNPs)
+
+#Remove list of cross-hybridising probes and SNP probes from Peters et al.
+library(readxl)
+sheets <- excel_sheets("Annotation of DNA methylation data/Cross reactive and SNP probes from Pidsley et al.xlsx")
+library(tidyverse)
+for (s in sheets)
+{
+    qcprobes <- read_excel('Annotation of DNA methylation data/Cross reactive and SNP probes from Pidsley et al.xlsx',
+                           sheet=s)%>%
+        pull(ProbeID)
+    CpGs_tokeep=setdiff(CpGs_tokeep,qcprobes)
+}
+
+#Get beta
+B <- getBeta(RSet)
+
+#Fix outliers
+B=B[CpGs_tokeep,]
+#Replace 0 with smallest positive value
+B[B == 0] <- min(B[B!=0])
+#Replace 1 with largest positive value
+B[B == 1] <- max(B[B!=1])
+
+#Produce quality control graphs to look at the data
+champ.QC(beta = B,
+         pheno = test$Sentrix_ID,
+         dendrogram = FALSE)
+#Correct for batch
+champ.SVD(beta=B,
+          pd=test,
+          resultsDir="./CHAMP_SVDimages/")
+
+#Run ComBat to correct batch effects
+library(sva)
+M <- logit2(B)
+
+myCombat=ComBat(dat=as.matrix(M), #it outputs an M-value matrix adjusted for batch
+                batch=test$Sentrix_ID,
+                mod=NULL)
+
+#Convert back to beta-values after batch correction to run SVD again
+myCombat=ilogit2(myCombat)
+
+#Run SVD again
+champ.SVD(beta=myCombat,
+          pd=test,
+          resultsDir="./CHAMP_SVDimages/batch_corrected/")
+
+#Run ComBat to correct position on batch
+library(sva)
+M <- logit2(myCombat)
+
+myCombat=ComBat(dat=as.matrix(M), #it outputs an M-value matrix adjusted for batch
+                batch=test$Sentrix_Position,
+                mod=NULL)
+
+#Convert back to beta-values after batch correction to run SVD again
+myCombat=ilogit2(myCombat)
+
+#Run SVD again
+champ.SVD(beta=myCombat,
+          pd=test,
+          resultsDir="./CHAMP_SVDimages/batch_position_corrected/")
+
+write.table(myCombat,
+            file="GSE....._filtered_batch_corrected_beta.txt",
+            quote=FALSE,
+            row.names=TRUE,
+            col.names=TRUE,
+            sep='\t')
+
+#Produce quality control graphs to look at the data
+champ.QC(beta = myCombat,
+         pheno = test$`disease state`,
+         dendrogram = FALSE)
+
+####Example 2####
+#Get the GEO dataset
+directory = "Datasets/Kidney/GSE....."
+setwd(directory)
+library(tidyverse)
+
+library(GEOquery)
+data <- getGEO("GSE.....",
+               destdir = getwd(),
+               GSEMatrix = FALSE,
+               AnnotGPL = FALSE,
+               getGPL = FALSE)
+GSM_IDs <- data@header$sample_id
+
+library(GEOquery)
+pheno <- rbind()
+for (g in GSM_IDs)
+{
+    data <- getGEO(g,
+                   destdir = getwd(),
+                   GSEMatrix = TRUE,
+                   AnnotGPL = FALSE,
+                   getGPL = FALSE)
+    
+    pheno <- rbind(pheno,
+                   data@header$characteristics_ch1)
+}
+
+test <- pheno
+colnames <- as.character(sapply(test[1,],
+                                str_extract,
+                                pattern = ".*(?=:)"))
+colnames(test) <- colnames
+test <- test %>%
+    as_tibble%>%
+    mutate_all(str_extract,
+               pattern = "(?<=:[[:blank:]]).*")%>%
+    mutate(`GEO accession` = GSM_IDs)
+
+#Remove soft files that were automatically downloaded
+filestoremove <- list.files(pattern=".soft")
+sapply(filestoremove,file.remove)
+
+#### formatting
+library(readxl)
+
+idat_files <- list.files(getwd(), pattern = "Grn.idat$")
+basenames <- sub("_Grn.idat", "", idat_files)
+test$Basename <- basenames
+
+# Save the merged dataset as CSV
+write_csv(test, "GSE...... phenotypes.csv")
+
+#### preprocessing 
+options(timeout = 100000000000000000000000)
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 10)
+
+#import
+library(R.utils)  # For gunzip function
+
+# Define the main folder where .gz files are stored
+main_folder <- "Datasets/Kidney/GSE......"
+
+# Find all .idat.gz files recursively
+gz_files <- list.files(main_folder, pattern = "\\.idat\\.gz$", full.names = TRUE, recursive = TRUE)
+
+# Extract each .gz file
+for (gz_file in gz_files) {
+  # Unzip the .gz file and keep only the extracted .idat
+  gunzip(gz_file, remove = TRUE, overwrite = TRUE)
+}
+
+
+#Check sex
+library(tidyverse)
+library(minfi)
+setwd(directory)
+
+targets <- read.metharray.sheet(getwd())
+RGSet <- read.metharray.exp(targets = targets, force=T)
+MSet <- preprocessRaw(RGSet)
+RSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+GRset <- mapToGenome(RSet)
+predictedSex <- getSex(GRset, cutoff = -2)$predictedSex
+
+test$predictedSex=predictedSex
+which(test$Sex!=test$predictedSex) #GSM6240867_203981500093_R04C01 doesn't match!
+
+write_csv(test,
+          file = "GSE..... phenotypes.csv")
+detP <- detectionP(RGSet)
+beta <- getBeta(MSet)
+
+#Filter probes
+memory.limit(1000000000)
+library(ChAMP)
+
+filtered_data <- champ.filter(beta = beta, 
+                              pd = pheno, filterXY = T,filterSNPs = T,
+                              detP = detP,
+                              arraytype = "EPIC")
+
+
+#Remove list of cross-hybridising probes and SNP probes from Peters et al.
+library(readxl)
+sheets <- excel_sheets("Annotation/Cross reactive and SNP probes from Pidsley et al.xlsx")
+beta = filtered_data$beta
+for (s in sheets)
+{
+  qcprobes <- read_excel('Annotation/Cross reactive and SNP probes from Pidsley et al.xlsx',
+                         sheet=s)%>%
+    pull(ProbeID)
+  beta <- beta[setdiff(rownames(beta),qcprobes),]
+}
+
+test=test[test$Basename%in%colnames(beta),]
+#Produce quality control graphs to look at the data
+champ.QC(beta = beta,
+         pheno = test$Sex,
+         dendrogram = FALSE)
+
+#Normalization of Type I and Type II probes
+myNorm <- champ.norm(beta=beta,
+                     arraytype = "EPIC")
+
+Samples=test$Basename
+
+test <- test %>%
+  separate(Basename, into = c("Sample_Name", "Array", "Position"), sep = "_")
+
+test2=as.data.frame(test[,c(1,2:5,26:29)])
+
+#Have a look at variables
+champ.SVD(beta=as.data.frame(beta),
+          pd=test2,
+          resultsDir="./CHAMP_SVDimages/")
+
+library(sva)
+
+M <- logit2(beta)
+
+myCombat=ComBat(dat=as.matrix(M), #it outputs an M-value matrix adjusted for batch
+                batch=test2$Array,
+                mod=NULL)
+
+beta_cor=ilogit2(myCombat)
+
+#Run SVD again
+champ.SVD(beta=as.data.frame(myCombat),
+          pd=test2,
+          resultsDir="./CHAMP_SVDimages/batch_corrected/")
+
+champ.QC(beta = myCombat,
+         pheno = test2$Sex,
+         dendrogram = FALSE)
+
+write.table(beta_cor,
+            file="GSE......_normalized_batch_corrected_beta.txt",
+            quote=FALSE,
+            row.names=TRUE,
+            col.names=TRUE,
+            sep='\t')
+
+####Example 3####
+#Get the GEO dataset
+setwd("Datasets/Lunk/GSE.....")
+library(tidyverse)
+library(GEOquery)
+data <- getGEO("GSE......",
+               destdir = getwd(),
+               GSEMatrix = FALSE,
+               AnnotGPL = FALSE,
+               getGPL = FALSE)
+GSM_IDs <- data@header$sample_id
+
+library(GEOquery)
+pheno <- rbind()
+for (g in GSM_IDs)
+{
+    data <- getGEO(g,
+                   destdir = getwd(),
+                   GSEMatrix = TRUE,
+                   AnnotGPL = FALSE,
+                   getGPL = FALSE)
+    
+    pheno <- rbind(pheno,
+                   data@header$characteristics_ch1)
+}
+
+test <- pheno
+colnames <- as.character(sapply(test[1,],
+                                str_extract,
+                                pattern = ".*(?=:)"))
+colnames(test) <- colnames
+test <- test %>%
+    as_tibble%>%
+    mutate_all(str_extract,
+               pattern = "(?<=:[[:blank:]]).*")%>%
+    mutate(`GEO accession` = GSM_IDs,
+           Sample_Name = GSM_IDs)
+
+#Obtain Sentrix_ID and Sentrix_Position from file names
+files <- tibble(filename = list.files()[grepl("Grn.idat.gz",list.files())])%>%
+  separate(filename,
+           into = c("GEO accession",
+                    "Sentrix_ID",
+                    "Sentrix_Position",
+                    "Rest"),
+           sep = "_")%>%
+  select(-Rest)
+test <- left_join(test,
+                  files)
+test <- test %>%
+  mutate(Basename = paste(`GEO accession`,
+                          Sentrix_ID,
+                          Sentrix_Position))
+write_csv(test,
+          file = "GSE....... phenotypes with replicates.csv")
+
+#Check sex
+library(tidyverse)
+library(minfi)
+targets <- read.metharray.sheet(getwd())
+RGSet <- read.metharray.exp(targets = targets)
+MSet <- preprocessRaw(RGSet)
+RSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+GRset <- mapToGenome(RSet)
+predictedSex <- getSex(GRset, cutoff = -2)$predictedSex
+
+test <- test %>%
+    mutate(Sex = ifelse(Sex=="Male",
+                           "M",
+                           "F"))
+which(test$Sex!=predictedSex) #All match!
+
+#Filter probes
+library(ChAMP)
+memory.limit(size=100000)
+myLoad <- champ.load(directory = getwd(),
+                     filterXY=TRUE, #Remove sex chr
+                     filterSNPs=TRUE) #6 samples failed QC
+
+library(readxl)
+sheets <- excel_sheets("Annotation/Cross reactive and SNP probes from Pidsley et al.xlsx")
+subbeta <- myLoad$beta
+library(tidyverse)
+for (s in sheets)
+{
+    qcprobes <- read_excel('Annotation/Cross reactive and SNP probes from Pidsley et al.xlsx',
+                           sheet=s)%>%
+        pull(ProbeID)
+    subbeta <- subbeta[setdiff(rownames(subbeta),qcprobes),]
+}
+myLoad$beta <- subbeta
+
+#Produce quality control graphs to look at the data
+champ.QC(beta = myLoad$beta,
+         pheno = test$Sex,
+         dendrogram = FALSE)
+
+#Normalization of Type I and Type II probes
+myNorm <- champ.norm(beta=myLoad$beta)
+
+#Have a look at variables
+test <- test%>%
+    mutate_at(vars(Sex:ethnicity,
+                   tissue:Basename),
+              as.factor)%>%
+    mutate_at(vars(age),
+              as.numeric)
+
+library(ChAMP)
+champ.SVD(beta=myNorm,
+          pd=test,
+          resultsDir="./CHAMP_SVDimages/")
+
+library(sva)
+
+#Run ComBat to correct batch effects
+M <- logit2(myNorm)
+
+myCombat=ComBat(dat=M, #it outputs an M-value matrix adjusted for batch
+                batch=test$Sentrix_ID,
+                mod=NULL)
+
+#Convert back to beta-values after batch correction to run SVD again
+myCombat=ilogit2(myCombat)
+
+#Run SVD again
+champ.SVD(beta=myCombat,
+          pd=test,
+          resultsDir="./CHAMP_SVDimages/batch_corrected/")
+
+M <- logit2(myCombat)
+
+myCombat=ComBat(dat=M, #it outputs an M-value matrix adjusted for batch
+                batch=test$Sentrix_Position,
+                mod=NULL)
+
+myCombat=ilogit2(myCombat)
+
+#Average replicates
+replicates <- test %>%
+    group_by(`GEO accession`)%>%
+    summarise(n = n())%>%
+    filter(n>1)%>%
+    arrange(-n)
+replicates_ids <- replicates$`GEO accession`
+
+#Change column names of myCombat
+colnames(myCombat) <- test$Basename
+
+bsnm <- c()
+pheno_toadd <- rbind()
+avgs <- cbind()
+for (d in replicates_ids)
+{
+    subbsnm <- test%>%filter(`GEO accession`==d)%>%pull(Basename)
+    bsnm <- c(bsnm,subbsnm)
+    pheno_toadd <- rbind(pheno_toadd,
+                         test%>%filter(Basename==subbsnm[1]))
+    avgs <- cbind(avgs,rowMeans(myCombat[,subbsnm]))
+}
+colnames(avgs) <- replicates_ids
+
+myCombat_avg <- myCombat
+pheno_avg <- test
+
+myCombat_avg <- myCombat_avg[,-which(colnames(myCombat_avg)%in%bsnm)]
+pheno_avg <- pheno_avg %>% filter(!Basename%in%bsnm)
+
+myCombat_avg <- cbind(myCombat_avg,
+                      avgs)
+pheno_avg <- bind_rows(pheno_avg,
+                       pheno_toadd)
+
+write.table(myCombat,
+            file="GSE......_normalized_batch_corrected_replicates_avg_beta.txt",
+            quote=FALSE,
+            row.names=TRUE,
+            col.names=TRUE,
+            sep='\t')
+
+write_csv(pheno_avg,
+          file = "GSE...... phenotypes.csv")
+
+library(ChAMP)
+champ.SVD(beta=myCombat_avg,
+          pd=pheno_avg,
+          resultsDir="./CHAMP_SVDimages/batch_position_corrected/")
+
+#Produce quality control graphs to look at the data
+champ.QC(beta = as.matrix(myCombat_avg),
+         pheno = pheno_avg$Sex,
+         dendrogram = FALSE)
+
+
+
