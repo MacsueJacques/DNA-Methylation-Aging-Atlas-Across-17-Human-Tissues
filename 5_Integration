@@ -1,0 +1,1654 @@
+# Comprehensive R Pipeline for Ageing DNA Methylation Atlas Analysis (with .txt format)
+
+# --------- SETUP ---------
+library(tidyverse)
+library(pheatmap)
+library(reshape2)
+library(igraph)
+library(ComplexHeatmap)
+library(WGCNA)
+library(MOFA2)
+library(RColorBrewer)
+
+options(stringsAsFactors = FALSE)
+setwd("R:/Eynon-lab/Ageing-and-exercise/Atlas/EWAS/Integration/DMPs")
+
+# --------- LOAD DATA ---------
+folder_path <- "R:/Eynon-lab/Ageing-and-exercise/Atlas/EWAS/Integration/DMPs"  # <- CHANGE THIS
+file_list <- list.files(folder_path, pattern = "*.txt", full.names = TRUE)
+
+meta_list <- lapply(file_list, function(file) {
+  tissue_name <- tools::file_path_sans_ext(basename(file)) %>% str_replace("_Meta_Analysis", "")
+  df <- read.delim(file)
+  df$tissue <- tissue_name
+  return(df)
+})
+
+combined_meta <- bind_rows(meta_list)
+
+# Standardize column names
+colnames(combined_meta) <- make.names(colnames(combined_meta))
+
+# --------- SIGNIFICANT DMPs ---------
+sig_threshold <- 0.005
+sig_dmps <- combined_meta %>% filter(FDR < sig_threshold)
+
+# --------- PRESENCE/ABSENCE MATRIX ---------
+dmp_matrix <- sig_dmps %>%
+  select(CpG, tissue) %>%
+  distinct() %>%
+  mutate(present = 1) %>%
+  pivot_wider(names_from = tissue, values_from = present, values_fill = 0)
+
+# --------- JACCARD SIMILARITY HEATMAP ---------
+jaccard_similarity <- function(x, y) sum(x & y) / sum(x | y)
+tissues <- colnames(dmp_matrix)[-1]
+jaccard_mat <- outer(tissues, tissues, Vectorize(function(i, j) jaccard_similarity(dmp_matrix[[i]], dmp_matrix[[j]])))
+dimnames(jaccard_mat) <- list(tissues, tissues)
+pheatmap(jaccard_mat, main = "Jaccard Similarity of DMPs across Tissues", 
+         color = colorRampPalette(brewer.pal(6, "PuRd"))(100))
+# Summary: Shows how similar the tissues are in terms of shared significant DMPs.
+
+# --------- EFFECT SIZE CORRELATION ---------
+effect_data <- combined_meta %>%
+  filter(CpG %in% sig_dmps$CpG) %>%
+  select(CpG, tissue, Effect.size) %>%
+  group_by(CpG, tissue) %>%
+  summarise(Effect.size = mean(Effect.size, na.rm = TRUE), .groups = 'drop') %>%
+  pivot_wider(names_from = tissue, values_from = Effect.size)
+
+effect_corr_matrix <- cor(effect_data[,-1], use = "pairwise.complete.obs")
+
+pheatmap(effect_corr_matrix, main = "Effect Size Correlation Across Tissues",
+         color = colorRampPalette(brewer.pal(9, "RdYlBu"))(100))
+# Summary: Correlation of age-associated effect sizes across tissues reveals coordinated changes or independence.
+
+
+# --------- SHARED AND UNIQUE DMPs ---------
+dmp_matrix$sum <- rowSums(dmp_matrix[,-1])
+shared_all <- dmp_matrix %>% filter(sum == length(tissues))
+shared_some <- dmp_matrix %>% filter(sum > 1 & sum < length(tissues))
+unique_tissue <- lapply(tissues, function(t) {
+  dmp_matrix %>% filter(!!sym(t) == 1 & sum == 1) %>% pull(CpG)
+})
+names(unique_tissue) <- tissues
+
+tissues2=tissues[1:15]
+
+# --------- COMBINED JACCARD + EFFECT SIZE CONSISTENCY HEATMAP ---------
+
+# Load libraries
+library(circlize)  # for colorRamp2
+library(ComplexHeatmap)
+library(viridis)
+library(grid)
+
+# Compute Jaccard matrix
+jaccard_similarity <- function(x, y) sum(x & y) / sum(x | y)
+tissues <- colnames(dmp_matrix)[-1]
+jaccard_mat <- outer(tissues, tissues, Vectorize(function(i, j) jaccard_similarity(dmp_matrix[[i]], dmp_matrix[[j]])))
+dimnames(jaccard_mat) <- list(tissues, tissues)
+
+# Compute number of shared DMPs
+shared_counts <- outer(tissues, tissues, Vectorize(function(i, j) sum(dmp_matrix[[i]] & dmp_matrix[[j]])))
+dimnames(shared_counts) <- list(tissues, tissues)
+
+# Prepare effect direction consistency
+effect_data <- combined_meta %>%
+  filter(FDR<0.005) %>%
+  select(CpG, tissue, Effect.size) 
+
+effect_data2=effect_data%>%
+  group_by(CpG, tissue) %>%
+  summarise(Effect.size = mean(Effect.size, na.rm = TRUE), .groups = 'drop') %>%
+  pivot_wider(names_from = tissue, values_from = Effect.size)
+
+effect_consistency <- matrix(NA, nrow = length(tissues), ncol = length(tissues))
+colnames(effect_consistency) <- tissues
+rownames(effect_consistency) <- tissues
+
+for (i in tissues) {
+  for (j in tissues) {
+    shared_cpgs <- dmp_matrix %>% 
+      filter(!!sym(i) == 1 & !!sym(j) == 1) %>% 
+      pull(CpG)
+    if (length(shared_cpgs) > 0 && all(c(i, j) %in% colnames(effect_data2))) {
+      eff_rows <- effect_data2 %>% filter(CpG %in% shared_cpgs)
+      
+      eff_i <- eff_rows %>% pull(!!sym(i))
+      eff_j <- eff_rows %>% pull(!!sym(j))
+      
+      # Remove NA and zero effects
+      valid_idx <- which(!is.na(eff_i) & !is.na(eff_j) & sign(eff_i) != 0 & sign(eff_j) != 0)
+      
+      if (length(valid_idx) > 0) {
+        same_direction <- sum(sign(eff_i[valid_idx]) == sign(eff_j[valid_idx]))
+        effect_consistency[i, j] <- same_direction / length(valid_idx)
+      }
+    }
+  }
+}
+
+# Create a single matrix combining both metrics: bottom triangle Jaccard, top triangle Effect consistency
+combined_matrix <- matrix(NA, nrow = length(tissues), ncol = length(tissues))
+colnames(combined_matrix) <- tissues
+rownames(combined_matrix) <- tissues
+
+for (i in seq_along(tissues)) {
+  for (j in seq_along(tissues)) {
+    if (i > j) {
+      combined_matrix[i,j] <- jaccard_mat[i,j]
+    } else if (i < j) {
+      combined_matrix[i,j] <- effect_consistency[i,j]
+    } else {
+      combined_matrix[i,j] <- 1  # Placeholder for diagonal (self tissue)
+    }
+  }
+}
+
+# Count total number of DMPs per tissue
+total_dmps <- sapply(tissues[1:15], function(t) sum(dmp_matrix[[t]]))
+
+combined_matrix=combined_matrix[1:15,1:15]
+
+library(circlize)
+library(viridis)
+
+jaccard_breaks <- seq(0, 0.2, by = 0.04)
+lower_colors <- colorRamp2(jaccard_breaks, 
+                           c("#e0f3f8", "#abd9e9", "#74add1", "#4575b4", "#313695", "#253494"))
+
+effect_breaks <- seq(0.7, 1, by = 0.06)
+upper_colors <- colorRamp2(effect_breaks,
+                           c("#fff7ec", "#fee8c8", "#fdbb84", "#fc8d59", "#e34a33", "#b30000"))
+
+heatmap_legend_param = list(title = NULL)
+
+# Dynamic text color function (black or white depending on fill)
+text_col <- function(fill_color) {
+  rgb_vals <- col2rgb(fill_color)
+  brightness <- mean(rgb_vals)
+  if (brightness < 150) "white" else "black"
+}
+
+
+legend1 <- Legend(title = "% Shared CpGs",
+                  at = jaccard_breaks,
+                  col_fun = lower_colors,
+                  labels = paste0(jaccard_breaks * 100, "%"),
+                  direction = "vertical")
+
+legend2 <- Legend(title = "% Same Direction",
+                  at = effect_breaks,
+                  col_fun = upper_colors,
+                  labels = paste0(effect_breaks * 100, "%"),
+                  direction = "vertical")
+
+# Create a more aesthetic color palette with transparency
+#col_fun <- colorRamp2(c(0, 0.5, 1), alpha(c("#b482d1", "#ffffb3", "#d1828f"), 0.5))
+
+# Save the plot to a high-resolution TIFF
+tiff("combined_heatmap_highres.tiff", width = 4000, height = 4000, res = 600)
+
+ht_combined <- Heatmap(combined_matrix,
+                       cluster_rows = FALSE,
+                       cluster_columns = FALSE,
+                       show_heatmap_legend = FALSE,  # removes default
+                       rect_gp = gpar(col = "grey90"),
+                       cell_fun = function(j, i, x, y, width, height, fill) {
+                         val <- combined_matrix[i, j]
+                         
+                         if (i > j) {
+                           # Lower triangle (Jaccard similarity)
+                           fill_color <- lower_colors(val)
+                           grid.rect(x, y, width, height, gp = gpar(fill = fill_color, col = "grey90"))
+                           
+                           text_color <- text_col(fill_color)
+                           percent_overlap <- 100 * val
+                           grid.text(paste0(shared_counts[i, j], "\n(", sprintf("%.0f", percent_overlap), "%)"),
+                                     x, y, gp = gpar(fontsize = 6, col = text_color))
+                           
+                         } else if (i < j) {
+                           # Upper triangle (Effect direction consistency)
+                           fill_color <- upper_colors(val)
+                           grid.rect(x, y, width, height, gp = gpar(fill = fill_color, col = "grey90"))
+                           
+                           text_color <- text_col(fill_color)
+                           grid.text(sprintf("%.0f%%", val * 100),
+                                     x, y, gp = gpar(fontsize = 7, col = text_color))
+                           
+                         } else {
+                           # Diagonal
+                           grid.rect(x, y, width, height, gp = gpar(fill = "#d9d9d9", col = NA))
+                           grid.text(total_dmps[i], x, y, gp = gpar(fontsize = 8, fontface = "bold"))
+                         }
+                       })
+
+draw(ht_combined,
+     heatmap_legend_side = "bottom",
+     annotation_legend_list = list(legend1, legend2))
+
+# Close TIFF device
+dev.off()
+
+#percentage overlap, calculated based on the smaller of the two tissues’ total DMP counts (so it's meaningful).
+
+# --------- ANALYTICAL ENHANCEMENTS FOR BIOLOGICAL INSIGHT AND ROBUSTNESS ---------
+
+# Load libraries
+library(tidyverse)
+library(missMethyl)
+library(reshape2)
+library(ggpubr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(readxl)
+
+# --------- STEP 1: DMP COUNTS VS AGE METRICS ---------
+
+# Assume 'meta_data' exists with tissue, sample_id, and age columns
+# If not, create a dummy one or adapt accordingly
+library(readxl)
+setwd("R:/Eynon-lab/Ageing-and-exercise/Atlas/EWAS/Integration/DMPs")
+meta_data=read_xlsx("Combined_pheno_age_all_tissues.xlsx")
+
+# Summarize per tissue
+age_summary <- meta_data %>%
+  group_by(tissue) %>%
+  summarise(N = n(),
+            AgeMedian = median(age, na.rm = TRUE),
+            AgeMean = mean(age, na.rm = TRUE),
+            AgeRange = max(age, na.rm = TRUE) - min(age, na.rm = TRUE))
+
+
+library(ggpubr)
+library(ggrepel)  # NEW for non-overlapping labels
+library(ggpubr)
+
+# --------- Improved Plots: DMPs vs Age Metrics ---------
+
+# Improved DMPs vs Age Range
+p1 <- ggplot(age_summary, aes(x = AgeRange, y = DMPs, size = N, color = DMPs)) +
+  geom_point(alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  geom_text_repel(aes(label = tissue), size = 4, fontface = "bold", max.overlaps = Inf) +
+  theme_bw() +
+  scale_color_gradient(low = "#6baed6", high = "#08306b") +
+  scale_size(range = c(3,8)) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+           aes(label = paste(..r.label.., ..p.label.., sep = " | ")), size = 5) +
+  labs(title = "DMPs vs Age Range", x = "Age Range (years)", y = "Number of DMPs", 
+       size = "Sample Size", color = "DMPs Count") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(size = 12))
+p1
+
+# Improved DMPs vs Age Median
+p2 <- ggplot(age_summary, aes(x = AgeMedian, y = DMPs, size = N, color = DMPs)) +
+  geom_point(alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  geom_text_repel(aes(label = tissue), size = 4, fontface = "bold", max.overlaps = Inf) +
+  theme_bw() +
+  scale_color_gradient(low = "#6baed6", high = "#08306b") +
+  scale_size(range = c(3,8)) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+           aes(label = paste(..r.label.., ..p.label.., sep = " | ")), size = 5) +
+  labs(title = "DMPs vs Age Median", x = "Median Age (years)", y = "Number of DMPs", 
+       size = "Sample Size", color = "DMPs Count") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(size = 12))
+p2
+
+p3 <- ggplot(age_summary, aes(x = AgeMean, y = DMPs, size = N, color = DMPs)) +
+  geom_point(alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  geom_text_repel(aes(label = tissue), size = 4, fontface = "bold", max.overlaps = Inf) +
+  theme_bw() +
+  scale_color_gradient(low = "#6baed6", high = "#08306b") +
+  scale_size(range = c(3,8)) +
+  stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top", 
+           aes(label = paste(..r.label.., ..p.label.., sep = " | ")), size = 5) +
+  labs(title = "DMPs vs Age Mean", x = "Mean Age (years)", y = "Number of DMPs", 
+       size = "Sample Size", color = "DMPs Count") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(size = 12))
+p3
+
+p1 <- p1 + theme(legend.position = "none")
+p2 <- p2 + theme(legend.position = "none")
+p3 <- p3 + theme(legend.position = "none")
+
+library(patchwork)
+
+combined_plot <- p1 + p2 + p3 + plot_layout(ncol = 3)
+
+ggsave("DMPs_vs_Age_All.png", plot = combined_plot,
+       width = 18, height = 6, dpi = 300)
+
+# Save improved plots
+ggsave("DMPs_vs_AgeRange_Improved2.pdf", p1, width = 8, height = 7)
+ggsave("DMPs_vs_AgeMedian_Improved2.pdf", p2, width = 8, height = 7)
+ggsave("DMPs_vs_AgeMean_Improved2.pdf", p2, width = 8, height = 7)
+
+# Also create a side-by-side combined plot
+combined_plot <- ggarrange(p1, p2,p3, ncol = 3, nrow = 1, labels = c("A", "B","C"))
+combined_plot
+ggsave("DMPs_vs_AgeRange_Median_Combined.pdf", combined_plot, width = 21, height = 7)
+
+#Tissue age range is predictive of DMP discovery power:
+#Tissues with wider age distributions show more age-associated methylation changes.
+#Makes sense — to detect age-related CpGs, you need variation in age.
+#Median/mean age ≠ DMPs:
+#  Even if a tissue is older (higher median), it doesn’t guarantee more DMPs.
+#What matters is the spread, not the central age.
+#“Age variance in a dataset is a stronger driver of statistical power to detect DMPs than the mean or median age.”
+#Designs with wide age coverage are optimal for ageing methylation studies.
+#Tissues with fewer DMPs may simply lack power due to narrow age range — not due to absence of biology.
+
+#This result does not suggest that some tissues age faster or have fewer ageing markers inherently — it suggests:
+#Observed DMP counts are biased by age span, not necessarily by biology.
+#Tissues with few DMPs may actually undergo changes — but you couldn't detect them due to limited age variation.
+#This highlights the importance of designing methylation studies with age diversity, not just older individuals.
+
+
+# --------- STEP 2: PATHWAY ENRICHMENT FOR SHARED AND UNIQUE DMPs ---------
+
+# Shared DMPs (CpGs present in all tissues)
+filter_shared=shared_some%>%filter(sum>=8)
+shared_cpgs <- filter_shared$CpG
+
+# Unique DMPs per tissue
+unique_cpgs_list <- lapply(unique_tissue, function(cpgs) cpgs)
+
+# Enrichment for shared CpGs (requires an annotation object, assume 'anno')
+anno=read.table("R:/Eynon-lab/Ageing-and-exercise/Atlas/Annotation/Annotation_EPIC.txt")
+shared_pathways <- gometh(sig.cpg = shared_cpgs, all.cpg = anno$CpG, collection = "GO")
+shared_pathways_filtered<-shared_pathways%>%filter(FDR<0.05)
+write.csv(shared_pathways_filtered, "Pathway_Enrichment_Shared_DMPs_8orMoreTissues0.05fdr.csv", row.names = FALSE)
+
+unique_cpgs_list2=unique_cpgs_list[-13]
+unique_cpgs_list2=unique_cpgs_list2[10:15]
+
+# Enrichment for unique CpGs
+for (t in names(unique_cpgs_list2)) {
+  enrich <- gometh(sig.cpg = unique_cpgs_list2[[t]], all.cpg = anno$CpG, collection = "GO")
+  enrich <-enrich%>%filter(FDR<0.05)
+  write.csv(enrich, paste0("loose_Pathway_Enrichment_Unique_DMPs_", t, ".csv"), row.names = FALSE)
+  enrich <-enrich%>%filter(FDR<0.005)
+  write.csv(enrich, paste0("stringent_Pathway_Enrichment_Unique_DMPs_", t, ".csv"), row.names = FALSE)
+}
+
+# --------- STEP 3: PERMUTATION TEST FOR DMP OVERLAP (SIGNIFICANCE) ---------
+
+library(future)
+library(furrr)
+plan(multisession)  # Use all available cores
+
+perm_test_overlap <- function(setA, setB, all_cpgs, n_perm = 10000) {
+  observed <- length(intersect(setA, setB))
+  null_dist <- replicate(n_perm, {
+    randA <- sample(all_cpgs, length(setA))
+    randB <- sample(all_cpgs, length(setB))
+    length(intersect(randA, randB))
+  })
+  pval <- mean(null_dist >= observed)
+  return(list(observed = observed, p_value = pval))
+}
+
+# Assuming you have a dmp_matrix with "CpG" as first column and tissues in the rest
+tissues2 <- tissues[1:15]
+dmp_list <- lapply(tissues2, function(t) {
+  dmp_matrix %>%
+    filter(!!sym(t) == 1) %>%
+    pull(CpG)
+})
+names(dmp_list) <- tissues2
+
+# Expand all unique tissue pairs
+perm_df <- expand.grid(tissue1 = tissues2, tissue2 = tissues2, stringsAsFactors = FALSE) %>%
+  filter(tissue1 < tissue2)
+
+# Run permutation test in parallel
+perm_results <- perm_df %>%
+  mutate(result = future_pmap(list(tissue1, tissue2), function(t1, t2) {
+    setA <- dmp_list[[t1]]
+    setB <- dmp_list[[t2]]
+    perm_test_overlap(setA, setB, all_cpgs_universe)
+  }, .options = furrr_options(seed = TRUE)))  
+
+perm_results <- perm_results %>%
+  mutate(observed_overlap = map_dbl(result, "observed"),
+         p_value = map_dbl(result, "p_value")) %>%
+  mutate(p_label = ifelse(p_value == 0, "< 1e-4", sprintf("%.4f", p_value)))%>%
+  select(-result)
+write.csv(perm_results, "Permutation_Test_DMP_Overlap.csv", row.names = FALSE)
+
+perm_results=read.csv("Permutation_Test_DMP_Overlap.csv")
+
+perm_results <- perm_results %>%
+  mutate(sig_label = case_when(
+    p_value < 0.001 ~ "***",
+    p_value < 0.01 ~ "**",
+    p_value < 0.05 ~ "*",
+    TRUE ~ ""
+  ))
+
+# Initialize empty matrix
+sig_mat <- matrix("", nrow = length(tissues2), ncol = length(tissues2),
+                  dimnames = list(tissues2, tissues2))
+
+# Fill upper triangle only
+for (k in seq_len(nrow(perm_results))) {
+  t1 <- perm_results$tissue1[k]
+  t2 <- perm_results$tissue2[k]
+  sig <- perm_results$sig_label[k]
+  sig_mat[t1, t2] <- sig
+  sig_mat[t2, t1] <- sig  # optional: mirror to lower triangle
+}
+
+tiff("combined_heatmap_highres_with_permutation.tiff", width = 4000, height = 4000, res = 600)
+
+ht_combined <- Heatmap(combined_matrix,
+                       cluster_rows = FALSE,
+                       cluster_columns = FALSE,
+                       show_heatmap_legend = FALSE,  # removes default
+                       rect_gp = gpar(col = "grey90"),
+                       cell_fun = function(j, i, x, y, width, height, fill) {
+                         val <- combined_matrix[i, j]
+                         
+                         if (i > j) {
+                           fill_color <- lower_colors(val)
+                           grid.rect(x, y, width, height, gp = gpar(fill = fill_color, col = "grey90"))
+                           
+                           text_color <- text_col(fill_color)
+                           grid.text(paste0(shared_counts[i, j], "\n(", sprintf("%.0f", 100 * val), "%)"),
+                                     x, y, gp = gpar(fontsize = 6, col = text_color))
+                           
+                           # Add significance star
+                           star <- sig_mat[i, j]
+                           if (star != "") {
+                             grid.text(star, x = x + unit(0.04, "npc"), y = y + unit(0.27, "npc"), 
+                                       gp = gpar(fontsize = 9, fontface = "bold", col = text_color))
+                           }
+                           
+                         } else if (i < j) {
+                           fill_color <- upper_colors(val)
+                           grid.rect(x, y, width, height, gp = gpar(fill = fill_color, col = "grey90"))
+                           
+                           text_color <- text_col(fill_color)
+                           grid.text(sprintf("%.0f%%", val * 100), x, y, gp = gpar(fontsize = 7, col = text_color))
+                           
+                           # Optional: Add star here instead if desired
+                         } else {
+                           grid.rect(x, y, width, height, gp = gpar(fill = "#d9d9d9", col = NA))
+                           grid.text(total_dmps[i], x, y, gp = gpar(fontsize = 8, fontface = "bold"))
+                         }
+                       })
+
+draw(ht_combined,
+     heatmap_legend_side = "bottom",
+     annotation_legend_list = list(legend1, legend2))
+
+# Close TIFF device
+dev.off()
+
+
+# --------- FINAL REMARKS ---------
+# You now have:
+# 1. DMP burden related to sample characteristics.
+# 2. Pathway enrichment for shared and unique DMPs.
+# 3. Statistical significance of DMP overlaps.
+
+message("Analysis Completed: DMP summary, Enrichment, Permutation Testing")
+
+
+# --------- WGCNA MODULE DETECTION ---------
+# Define your threshold
+fdr_cutoff <- 0.005
+
+# For each tissue, extract significant CpGs
+sig_cpgs_list <- split(combined_meta, combined_meta$tissue) %>%
+  lapply(function(df) {
+    df %>%
+      filter(FDR < fdr_cutoff) %>%
+      pull(CpG) %>%
+      unique()
+  })
+
+# View example
+str(sig_cpgs_list[1])
+
+# Intersect across all 15 tissues (or adjust subset)
+tissue_names <- names(sig_cpgs_list)
+tissue_names=c("Adipose","Brain","Breast","Buccal","Cervix", 
+"Colon","Heart","Kidney","Liver","Lung","Muscle","Pancreas","Skin")  
+shared_cpgs1 <- Reduce(intersect, sig_cpgs_list[tissue_names])
+
+tissue_names2=c("Adipose","Brain","Breast","Buccal","Cervix", 
+               "Colon","Kidney","Liver","Lung","Muscle","Pancreas","Skin")  
+shared_cpgs2 <- Reduce(intersect, sig_cpgs_list[tissue_names])
+
+tissue_names3=c("Adipose","Brain","Breast","Buccal","Cervix", 
+               "Colon","Kidney","Liver","Lung","Muscle","Skin")  
+shared_cpgs3 <- Reduce(intersect, sig_cpgs_list[tissue_names])
+
+length(shared_cpgs)  # should be < individual sets
+
+# tissue_beta_list will hold one beta matrix per tissue
+tissue_beta_list1 <- list()
+
+for (t in tissue_names) {
+  sig_cpgs <- sig_cpgs_list[[t]]
+  # Filter to tissue samples
+  tissue_samples <- meta_data %>% filter(tissue == t) %>% pull(Sample_Name)
+  beta_sub <- beta_matrix[sig_cpgs, tissue_samples, drop = FALSE]
+  
+  # Check for missing values
+  if (anyNA(beta_sub)) {
+    warning(paste("NA values found in tissue:", t))
+  }
+  
+  # Transpose for WGCNA: samples x CpGs
+  tissue_beta_list[[t]] <- t(beta_sub)
+}
+
+
+# --------- SAVE OUTPUTS ---------
+write.csv(shared_all, "Shared_All_Tissues_DMPs.csv")
+write.csv(shared_some, "Shared_Some_Tissues_DMPs.csv")
+write.csv(effect_corr_matrix, "EffectSize_Correlation.csv")
+write.csv(jaccard_mat, "Jaccard_Similarity.csv")
+write.csv(module_membership, "WGCNA_Module_Membership.csv")
+write.csv(key_drivers, "WGCNA_Module_Key_CpGs.csv")
+# Save MOFA object
+saveRDS(mofa_trained, file = "mofa_trained_model.rds")
+# Save key models and matrices for downstream reuse
+saveRDS(effect_data, file = "effect_data_matrix.rds")
+saveRDS(effect_matrix_t, file = "effect_matrix_transposed.rds")
+saveRDS(net, file = "wgcna_network_model.rds")
+saveRDS(module_membership, file = "wgcna_module_membership.rds")
+saveRDS(key_drivers, file = "wgcna_module_key_drivers.rds")
+saveRDS(MEs, file = "wgcna_module_eigengenes.rds")
+
+
+message("Full analysis completed with DMP integration, network inference, and factor decomposition.")
+
+###Bubble plot for enrichment analysis
+# Load required packages
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(scales)
+library(ggthemes)
+
+# Load your data
+df <- read_csv("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs/Pathway_Enrichment_Shared_DMPs_withblood_9orMoreTissues0.05fdr.csv")
+
+# Select top 30 based on FDR
+top_pathways <- df %>%
+  arrange(FDR) %>%
+  slice(1:30) %>%
+  mutate(
+    TERM = factor(TERM, levels = rev(unique(TERM))),  # for horizontal order
+    log10FDR = -log10(FDR)
+  )
+
+# Create bubble plot
+ggplot(top_pathways, aes(x = log10FDR, y = TERM, size = DE, color = log10FDR)) +
+  geom_point(stroke = 1.2) +
+  scale_color_gradientn(colors = rev(c("#67001F", "#B2182B", "#D6604D", "#F4A582", 
+                                       "#FDDBC7", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC", "#053061")),
+                        name = expression(-log[10](FDR))) +
+  scale_size(range = c(3, 12), name = "Gene Count (DE)") +
+  labs(
+    title = "Top 30 Enriched Pathways by FDR",
+    x = expression(-log[10](FDR)),
+    y = "Pathway"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 14),
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+
+
+
+# Select top 30 based on FDR
+top_pathways <- df %>%
+  arrange(FDR) %>%
+  slice(1:30) %>%
+  mutate(
+    TERM = factor(TERM, levels = unique(TERM)),  # keep order for x-axis
+    log10FDR = -log10(FDR)
+  )
+
+# Create horizontal bubble plot
+p=ggplot(top_pathways, aes(x = TERM, y = log10FDR, size = DE, fill = log10FDR)) +
+  geom_point(shape = 21, color = "black", stroke = 1.2) +
+  scale_fill_gradientn(colors = rev(c("#67001F", "#B2182B", "#D6604D", "#F4A582", 
+                                      "#FDDBC7", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC", "#053061")),
+                       name = expression(-log[10](FDR))) +
+  scale_size(range = c(3, 12), name = "Gene Count (DE)") +
+  labs(
+    title = "Top 30 Enriched Pathways by FDR",
+    x = "Pathway",
+    y = expression(-log[10](FDR))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 16),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+tiff('Top 30 Enriched Pathways Bubble plot horizontal 9 or more tissues by FDR.tiff',
+     width =500,
+     height = 300,
+     units = 'mm',
+     res=600)
+p
+dev.off()
+
+library(stringr)
+
+top_pathways <- df %>%
+  arrange(FDR) %>%
+  slice(1:30) %>%
+  mutate(
+    TERM = str_wrap(TERM, width = 50),  # wraps long labels
+    TERM = factor(TERM, levels = unique(TERM)),  # retain plotting order
+    log10FDR = -log10(FDR)
+  )
+
+p=ggplot(top_pathways, aes(x = TERM, y = log10FDR, size = DE, fill = log10FDR)) +
+  geom_point(shape = 21, color = "black", stroke = 0.8) +
+  scale_fill_gradientn(colors = rev(c("#67001F", "#B2182B", "#D6604D", "#F4A582", 
+                                      "#FDDBC7", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC", "#053061")),
+                       name = expression(-log[10](FDR))) +
+  scale_size(range = c(3, 12), name = "Gene Count (DE)") +
+  labs(
+    title = "Top 30 Enriched Pathways by FDR",
+    x = "Pathway",
+    y = expression(-log[10](FDR))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 85, hjust = 1, vjust = 1, size = 14),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+tiff('Top 30 Enriched Pathways Bubble plot horizontal 9 or more tissues by FDR.tiff',
+     width =500,
+     height = 300,
+     units = 'mm',
+     res=600)
+p
+dev.off()
+
+
+############mitch analysis
+#### Integration ####
+library(tidyverse)
+
+setwd("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs")
+
+# List all .txt files
+txt_files <- list.files(pattern = "\\.txt$", full.names = TRUE)
+
+# Loop through each file
+for (file_path in txt_files) {
+  # Extract the file name without extension
+  file_name <- tools::file_path_sans_ext(basename(file_path))
+  
+  # Read the .txt file (adjust read.table/read.delim based on your file format)
+  data <- read.delim(file_path, header = TRUE, sep = "\t")  # or read.table(...)
+  data=mutate(data, t=Effect.size/SE)
+  # Assign the data to a variable named after the file
+  assign(file_name, data)
+}
+
+#Methylation
+####Use Mitch to contrast results####
+library("mitch")
+library(tidyverse)
+
+txt_files=txt_files[-1]
+# Process each file
+for (file_path in txt_files) {
+  # Extract a clean base name for naming variables
+  base_name <- tools::file_path_sans_ext(basename(file_path))
+  
+  # Read the methylation data
+  meth <- read.delim(file_path)
+  
+  # Select necessary columns
+  meth1 <- meth %>%
+    mutate(t=Effect.size/SE)%>%
+    select("CpG", "Effect.size", "SE", "P.value", "FDR", "t", "Annotated.gene.s.")
+  
+  # Filter out rows without gene annotations
+  methg_spl <- strsplit(meth1$`Annotated.gene.s.`, ";")
+  meth1 <- meth1[which(lengths(methg_spl) > 0), ]
+  
+  # Expand rows by gene
+  x <- apply(meth1, 1, function(x) {
+    GENES <- unlist(strsplit(as.character(x["Annotated.gene.s."]), ";"))
+    lapply(GENES, function(G) {
+      y <- x[1:(length(x)-1)]
+      y <- as.list(y)
+      y$Gene <- G
+      return(y)
+    }) %>% do.call(rbind, .)
+  })
+  meth_fix <- do.call(rbind, x)
+  
+  # Clean and convert to numeric
+  meth_fix2 <- as.data.frame(apply(meth_fix[, c(2:6)], 2, as.numeric))
+  meth_fix2$gene <- unlist(meth_fix[, "Gene"])
+  meth1 <- meth_fix2[,c("gene","t")]
+  meth1 <- aggregate(. ~ gene, meth1, sum)
+  
+  # Save the result with dynamic name like Adipose1, Muscle1
+  assign(paste0(base_name, "1"), meth1)
+}
+
+# Prepare for mitch
+l <- list("Adipose" = Adipose1, "Blood"=Blood1, "Brain"=Brain1, "Breast"=Breast1, "Buccal"=Buccal1, "Cervix"=Cervix1,
+          "Colon"=Colon1, "Heart"=Heart1, "Kidney"=Kidney1, "Liver"=Liver1, "Lung"=Lung1, "Muscle"=Muscle1,
+          "Pancreas"=Pancreas1, "Rectum"=Rectum1, "Retina"=Retina1, "Skin"=Skin1)
+mitch_result <- mitch_import(x = l, geneIDcol = "gene", DEtype = "limma")
+
+
+#Fetch gene sets 
+download.file("https://reactome.org/download/current/ReactomePathways.gmt.zip", destfile="ReactomePathways.gmt.zip")
+unzip("ReactomePathways.gmt.zip")
+genesets <- gmt_import("ReactomePathways.gmt")
+
+setwd("//ad.monash.edu/home/User050/mjac0029/Desktop/Papers in progress/Methylation Multi OMICS skeletal muscle VO2 and exercise/MSigDB files/MSigDB/msigdb_v2022.1.Hs_GMTs")
+genesets2<- gmt_import("c5.all.v2023.2.Hs.symbols.gmt")
+
+#Calculate enrichment priority as significance
+setwd("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs")
+
+res <- mitch_calc(x=mitch_result,genesets = genesets ,priority = "significance",minsetsize = 5, resrows = 10)
+head(res$enrichment_result,50)
+mitch_report(res = res, outfile = "myreport_significance_reactome.html")
+mitch_plots(res,outfile="mycharts_significance_reactome.pdf")
+
+#save results as table
+res=res$enrichment_result
+res_sig=res[res$p.adjustMANOVA<0.005 ,]
+
+#Reproduce plot using results table
+res1 = mutate(res, sig=ifelse(res$p.adjustMANOVA<0.005, "FDR<0.005", "Not Sig"))
+write.csv(res1, "mitch_results_reactome_17tissues_with_blood.csv")
+
+#do for GO
+res2 <- mitch_calc(x=mitch_result,genesets = genesets2 ,priority = "significance",minsetsize = 5, resrows = 10)
+head(res2$enrichment_result,50)
+mitch_report(res = res2, outfile = "myreport_significance_GO.html")
+mitch_plots(res2,outfile="mycharts_significance_GO_blood.pdf")
+
+#save results as table
+res3=res2$enrichment_result
+res_sig=res3[res3$p.adjustMANOVA<0.005 ,]
+
+#Reproduce plot using results table
+res3 = mutate(res3, sig=ifelse(res3$p.adjustMANOVA<0.005, "FDR<0.005", "Not Sig"))
+write.csv(res3, "mitch_results_GO_17tissues_with_blood.csv")
+
+library("ggrepel")
+
+tiff('Effect size versus significance pathways GO ageing with blood.tiff', width =8, height = 6, units = 'in', res=600)
+pvsef=ggplot(res3, aes(x=`s.dist`, y=-log(`p.adjustMANOVA`)))+
+  geom_point(aes(col=sig))+
+  scale_color_manual(values=c("#71a4e2", "gray"), name = " ")+
+  theme_minimal()+
+  labs(y="-log(p.adjustedMANOVA)", x="s.dist")
+pvsef
+dev.off()
+
+#Calculate enrichment priority effect size
+res <- mitch_calc(x=m,genesets = genesets ,priority = "effect",minsetsize = 5, resrows = 25)
+head(res$enrichment_result,50)
+mitch_report(res = res, outfile = "myreport_effect_hpo.html")
+mitch_plots(res,outfile="mycharts_effect_hpo.pdf")
+
+#Reproduce HeatMap
+d=ncol(res2$input_profile)
+
+if (d==1) {
+  formatted<-t(as.data.frame(res2$analysis_metrics[ c(1,2,3,4,5 ) ]))
+} else if (d==2) {
+  unformatted<-t(as.data.frame(res2$analysis_metrics[ c(2,3,4,5,11,12 )  ]))
+  formatted<-unformatted
+  formatted[1:4]<-as.character(round(as.numeric(unformatted[1:4]) , digits=0))
+  formatted[5:6]<-as.character(round(as.numeric(unformatted[5:6]) , digits=5))
+} else if (d>2) {
+  formatted<-t(as.data.frame(res2$analysis_metrics[ c(2,3,4,5 )  ]))
+}
+
+colnames(formatted)="Profile metrics"
+
+formatted %>%
+  kbl(caption="Profiling data metrics") %>%
+  kable_styling("hover", full_width = FALSE)
+
+
+
+hmapx<-head(res2$enrichment_result[,4:(4+d-1)],45)
+rownames(hmapx)<-head(res2$enrichment_result$set,45)
+colnames(hmapx)<-gsub("^s.","",colnames(hmapx))
+my_palette <- colorRampPalette(c("#4b2991","#932da3","#d43f96", "#f7667c","#f89f77","#edd9a3"))(n = 10)
+my_palette2 <- colorRampPalette(c("#003049", "#669bbc", "#F1E1C2", "#D15B47", "#8B2323"))(n = 10)
+
+hmapx=as.matrix(hmapx)
+
+
+tiff('Heatplot integration mitch with blood4.tiff',
+     width =300,
+     height = 400,
+     units = 'mm',
+     res=600)
+heatmap.2(hmapx,scale="none",Rowv = T, Colv = T,margin=c(10, 25),
+          cexRow=0.8,trace="none",cexCol=1,col=my_palette2)
+dev.off()
+
+
+###########################Cross-tissue network based analysis
+# Example check
+tstat_matrix=res2$input_profile 
+str(tstat_matrix)  # Should be a numeric matrix/dataframe
+summary(tstat_matrix)
+
+# Remove genes with too many NAs
+tstat_matrix <- tstat_matrix[rowSums(is.na(tstat_matrix)) <= 2, ]
+
+# Optional: Z-score per gene
+tstat_scaled <- t(apply(tstat_matrix, 1, scale))
+
+# Spearman correlation preferred for robustness
+cor_matrix <- cor(t(tstat_scaled), method = "spearman", use = "pairwise.complete.obs")
+saveRDS(cor_matrix, "spearman_correlation_all_tissues_genes_usingmitch_tstat.rds")
+saveRDS(res2$input_profile, "mitch_tstats_all_tissues.rds")
+
+cor_matrix=readRDS("spearman_correlation_all_tissues_genes_usingmitch_tstat.rds")
+tstatmatrix=readRDS("mitch_tstats_all_tissues.rds")
+
+write.csv(tstatmatrix, "mitch_tstats_all_tissues.csv")
+
+dist_matrix <- as.dist(1 - cor_matrix)
+hc <- hclust(dist_matrix, method = "average")
+hc$labels <- rownames(cor_matrix)
+
+plot(hc, labels = FALSE, hang = -1, main = "Gene-Gene Correlation Dendrogram")
+rect.hclust(hc, k = 10, border = "red")  # Try with different k
+
+library(dynamicTreeCut)
+clusters <- cutreeDynamic(dendro = hc, distM = as.matrix(dist_matrix),
+                          deepSplit = 2, pamRespectsDendro = FALSE,
+                          minClusterSize = 50)
+
+# Determine number of dynamic clusters (excluding "0" = unassigned)
+n_dyn <- length(unique(clusters[clusters != 0]))
+
+# Now apply cutree using the same number of clusters
+clusters_alt <- cutree(hc, k = n_dyn)
+
+# Choose cut height or number of clusters
+clusters1 <- cutree(hc, k = 10)
+clusters2 <- cutree(hc, k = 30)  # Or use `h = ...`
+
+table(clusters_alt)     # Number of genes in each adaptive module
+table(clusters2)    # Number of genes in each fixed-k module
+table(clusters1)
+
+# Visual summary
+barplot(table(clusters1), main = "k=10")
+barplot(table(clusters2), main = "k=30")
+barplot(table(clusters_alt), main = "dynamic d=2")
+
+# Convert to dist
+dmat <- dist_matrix
+
+# Silhouette for each method
+library(cluster)
+sil1 <- silhouette(clusters1, dmat)
+sil2 <- silhouette(clusters2, dmat)
+sil_dyn2 <- silhouette(clusters_alt, dmat)
+
+# Plot average silhouette width
+mean(sil1[, 3])     # k = 10
+mean(sil2[, 3])     # k = 30
+mean(sil_dyn2[, 3]) # d = 2
+
+# Split genes into modules
+modules_dyn <- split(names(clusters_alt), clusters_alt)
+modules_fixed <- split(names(clusters2), clusters2)
+modules_fixed1 <- split(names(clusters1), clusters1)
+
+# Remove cluster "0" (unassigned) from dynamic
+modules_dyn <- modules_dyn[names(modules_dyn) != "0"]
+
+valid_genes <- rownames(cor_matrix)
+
+# Keep only genes present in correlation matrix
+modules_dyn <- lapply(modules_dyn, function(genes) intersect(genes, valid_genes))
+
+# Remove empty or too-small modules (e.g., after filtering)
+modules_dyn <- modules_dyn[sapply(modules_dyn, length) >= 10]
+modules_fixed <- modules_fixed[sapply(modules_fixed, length) >= 30]
+modules_fixed1 <- modules_fixed1[sapply(modules_fixed1, length) >= 30]
+
+# Helper function: top 10 hub genes based on connectivity
+get_hubs <- function(gene_list, cor_mat, top_n = 20) {
+  hubs <- lapply(gene_list, function(genes) {
+    sub_cor <- cor_mat[genes, genes, drop = FALSE]
+    connectivity <- rowSums(abs(sub_cor), na.rm = TRUE)
+    sort(connectivity, decreasing = TRUE)[1:min(top_n, length(connectivity))]  # handle small clusters
+  })
+  return(hubs)
+}
+
+hub_genes_dyn <- get_hubs(modules_dyn, cor_matrix)
+hub_genes_fixed <- get_hubs(modules_fixed, cor_matrix)
+hub_genes_fixed1 <- get_hubs(modules_fixed1, cor_matrix)
+
+# Helper: average t-stats across tissues for each module
+get_avg_tstats <- function(gene_list, tstat_mat) {
+  lapply(gene_list, function(genes) {
+    colMeans(tstat_mat[genes, , drop = FALSE], na.rm = TRUE)
+  })
+}
+
+avg_tstat_dyn <- get_avg_tstats(modules_dyn, tstatmatrix)
+avg_tstat_fixed <- get_avg_tstats(modules_fixed, tstatmatrix)
+avg_tstat_fixed1 <- get_avg_tstats(modules_fixed1, tstatmatrix)
+
+# Optional: Visualise
+library(pheatmap)
+png("heatmap_dynamic_modules_avg_tstat.png", width = 1600, height = 2000, res = 300)
+pheatmap(do.call(rbind, avg_tstat_dyn), main = "Dynamic Modules – Avg t-stat per Tissue",
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         fontsize_row = 6, fontsize_col = 10)
+dev.off()
+
+png("heatmap_30modules_avg_tstat.png", width = 1600, height = 2000, res = 300)
+pheatmap(do.call(rbind, avg_tstat_fixed), main = "Fixed k=30 Modules – Avg t-stat per Tissue",
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         fontsize_row = 6, fontsize_col = 10)
+dev.off()
+
+png("heatmap_10modules_avg_tstat.png", width = 1600, height = 2000, res = 300)
+pheatmap(do.call(rbind, avg_tstat_fixed1), main = "Fixed k=10 Modules – Avg t-stat per Tissue",
+         cluster_rows = TRUE, cluster_cols = TRUE, 
+         fontsize_row = 6, fontsize_col = 10)
+dev.off()
+
+#classify modules by direction type
+# modules_dyn is a named list: names = Module 1, Module 2, ..., values = gene vectors
+avg_tstat_dyn <- sapply(modules_dyn, function(genes) {
+  colMeans(tstatmatrix[genes, , drop = FALSE], na.rm = TRUE)
+})
+avg_tstat_dyn <- t(avg_tstat_dyn)
+
+avg_tstat_fixed <- sapply(modules_fixed, function(genes) {
+  colMeans(tstatmatrix[genes, , drop = FALSE], na.rm = TRUE)
+})
+avg_tstat_fixed <- t(avg_tstat_fixed)
+
+avg_tstat_fixed1 <- sapply(modules_fixed1, function(genes) {
+  colMeans(tstatmatrix[genes, , drop = FALSE], na.rm = TRUE)
+})
+avg_tstat_fixed1 <- t(avg_tstat_fixed1)
+
+classify_pattern <- function(row) {
+  if (all(row > 0)) return("Universal ↑")
+  if (all(row < 0)) return("Universal ↓")
+  if (sum(abs(row) > 1.5) == 1) return("Tissue-specific")
+  return("Divergent")
+}
+
+get_direction_labels <- function(avg_matrix) {
+  apply(avg_matrix, 1, classify_pattern)
+}
+
+direction_dyn <- get_direction_labels(avg_tstat_dyn)
+direction_fixed <- get_direction_labels(avg_tstat_fixed)
+direction_fixed1 <- get_direction_labels(avg_tstat_fixed1)
+
+#get top tissues
+get_top_tissue_labels <- function(avg_matrix) {
+  top_tissue <- apply(abs(avg_matrix), 1, which.max)
+  direction <- mapply(function(i, mod) sign(avg_matrix[mod, i]), 
+                      i = top_tissue, mod = rownames(avg_matrix))
+  tissue_names <- colnames(avg_matrix)[top_tissue]
+  paste0(tissue_names, ifelse(direction > 0, " ↑", " ↓"))
+}
+
+
+get_top_n_tissues <- function(avg_tstat_matrix, n = 5, threshold = 0) {
+  apply(avg_tstat_matrix, 1, function(x) {
+    abs_vals <- abs(x)
+    top_idx <- order(abs_vals, decreasing = TRUE)[1:n]
+    tissues <- names(x)[top_idx]
+    dirs <- ifelse(x[top_idx] > 0, "↑", "↓")
+    paste0(tissues, " ", dirs, collapse = ", ")
+  })
+}
+
+top_tissue_dyn <- get_top_tissue_labels(avg_tstat_dyn)
+top_tissue_fixed <- get_top_tissue_labels(avg_tstat_fixed)
+top_tissue_fixed1 <- get_top_tissue_labels(avg_tstat_fixed1)
+
+top_tissue_dyn_n <- get_top_n_tissues(avg_tstat_dyn)
+top_tissue_fixed_n <- get_top_n_tissues(avg_tstat_fixed)
+top_tissue_fixed1_n <- get_top_n_tissues(avg_tstat_fixed1)
+
+
+#Hub genes and driver genes
+get_module_hubs <- function(modules, cor_matrix, top_n = 2) {
+  sapply(modules, function(genes) {
+    cor_sub <- cor_matrix[genes, genes, drop = FALSE]
+    hub_score <- rowSums(abs(cor_sub), na.rm = TRUE)
+    paste(names(sort(hub_score, decreasing = TRUE)[1:top_n]), collapse = ", ")
+  })
+}
+
+get_driver_gene <- function(modules, cor_matrix, tstatmatrix) {
+  sapply(modules, function(genes) {
+    cor_sub <- cor_matrix[genes, genes, drop = FALSE]
+    conn <- rowSums(abs(cor_sub), na.rm = TRUE)
+    beta <- rowMeans(abs(tstatmatrix[genes, , drop = FALSE]), na.rm = TRUE)
+    score <- conn * beta
+    names(score[which.max(score)])
+  })
+}
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+
+symbol_to_entrez <- function(symbols) {
+  suppressMessages(
+    bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db) %>%
+      filter(!is.na(ENTREZID)) %>%
+      pull(ENTREZID)
+  )
+}
+
+genesets_list <- genesets2
+run_custom_enrichment <- function(modules, gene_sets) {
+  lapply(modules, function(genes) {
+    if (length(genes) < 10) return(NA)
+    res <- suppressMessages(
+      enricher(
+        gene = genes,
+        TERM2GENE = stack(gene_sets)[, c(2, 1)],
+        pAdjustMethod = "BH"
+      )
+    )
+    if (is.null(res) || nrow(res@result) == 0) return(NA)
+    res@result$Description[1]
+  })
+}
+
+top_msigdb <- run_custom_enrichment(modules_dyn, genesets_list)
+top_msigdb_fixed <- run_custom_enrichment(modules_fixed, genesets_list)
+top_msigdb_fixed1 <- run_custom_enrichment(modules_fixed1, genesets_list)
+
+build_summary_table <- function(modules, cor_matrix, tstatmatrix, avg_tstat, direction, top_tissue) {
+  
+  # --- HUB GENES ---
+  get_module_hubs <- function(modules, cor_matrix, top_n = 2) {
+    sapply(modules, function(genes) {
+      cor_sub <- cor_matrix[genes, genes, drop = FALSE]
+      hub_score <- rowSums(abs(cor_sub), na.rm = TRUE)
+      paste(names(sort(hub_score, decreasing = TRUE)[1:top_n]), collapse = ", ")
+    })
+  }
+  
+  # --- DRIVER GENES ---
+  get_driver_gene <- function(modules, cor_matrix, tstatmatrix) {
+    sapply(modules, function(genes) {
+      cor_sub <- cor_matrix[genes, genes, drop = FALSE]
+      conn <- rowSums(abs(cor_sub), na.rm = TRUE)
+      beta <- rowMeans(abs(tstatmatrix[genes, , drop = FALSE]), na.rm = TRUE)
+      score <- conn * beta
+      names(score[which.max(score)])
+    })
+  }
+  
+  # --- GO/MSigDB Term Placeholders ---
+  run_go_placeholder <- function(modules) {
+    rep(NA, length(modules))
+  }
+  
+  # --- Generate Table ---
+  module_ids <- names(modules)
+  
+  final_table <- data.frame(
+    Module_ID = module_ids,
+    Direction_Type = direction[module_ids],
+    Top_Tissue = top_tissue[module_ids],
+    Top_Hub_Genes = get_module_hubs(modules, cor_matrix)[module_ids],
+    Driver_Score_Gene = get_driver_gene(modules, cor_matrix, tstatmatrix)[module_ids],
+    stringsAsFactors = FALSE
+  )
+  
+  return(final_table)
+}
+
+# If not yet built, here's how you'd create the base tables
+summary_dyn <- build_summary_table(modules_dyn, cor_matrix, tstatmatrix, avg_tstat_dyn, direction_dyn, top_tissue_dyn)
+summary_fixed <- build_summary_table(modules_fixed, cor_matrix, tstatmatrix, avg_tstat_fixed, direction_fixed, top_tissue_fixed)
+summary_fixed1 <- build_summary_table(modules_fixed1, cor_matrix, tstatmatrix, avg_tstat_fixed1, direction_fixed1, top_tissue_fixed1)
+
+summary_dyn$Top_MSigDB_Term <- unlist(top_msigdb)
+summary_fixed$Top_MSigDB_Term <- unlist(top_msigdb_fixed)
+summary_fixed1$Top_MSigDB_Term <- unlist(top_msigdb_fixed1)
+
+summary_dyn$Top_Tissue <- top_tissue_dyn_n
+summary_fixed$Top_Tissue <- top_tissue_fixed_n
+summary_fixed1$Top_Tissue <- top_tissue_fixed1_n
+
+summary_fixed1$Active_Tissue_List <- apply(avg_tstat_fixed1, 1, function(x) {
+  idx <- which(abs(x) > 1.5)
+  if (length(idx) == 0) return(NA)
+  tissues <- names(x)[idx]
+  dirs <- ifelse(x[idx] > 0, "↑", "↓")
+  paste0(tissues, " ", dirs, collapse = ", ")
+})
+
+write.csv(summary_dyn, "module_summary_dynamic.csv", row.names = FALSE)
+write.csv(summary_fixed, "module_summary_fixed30.csv", row.names = FALSE)
+write.csv(summary_fixed1, "module_summary_fixed10.csv", row.names = FALSE)
+
+summary_dyn=read.csv("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs/module_summary_dynamic.csv")
+full_gene_disrruption=read.csv("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs/full_gene_module_disruption_annotated.csv")
+
+full_gene_disrruption2=full_gene_disrruption%>%filter(Disruption != 0)%>%drop_na()
+write.csv(full_gene_disrruption2, "filtered_full_gene_dirruption.csv")
+
+gene_summary <- full_gene_disrruption2 %>%
+  group_by(Module) %>%
+  summarise(
+    n_genes = n_distinct(Gene),
+    Total_Disruption_Score = sum(Disruption, na.rm = TRUE)
+  ) %>%
+  arrange(desc(Total_Disruption_Score))  # Optional: sort by impact
+
+gene_summary2 <- gene_summary %>%
+  mutate(Avg_Disruption = Total_Disruption_Score / n_genes)
+
+gene_summary2 <- gene_summary2 %>%
+  mutate(Normalized_Score = scales::rescale(Total_Disruption_Score, to = c(0, 100)))
+
+library(dplyr)
+library(stringr)
+
+# Create summary per Module × Effect group
+gene_summary <- full_gene_disrruption2 %>%
+  group_by(Module, Effect) %>%
+  summarise(
+    n_genes = n_distinct(Gene),
+    Total_Disruption_Score = sum(Disruption, na.rm = TRUE),
+    Mean_Disruption = mean(Disruption, na.rm = TRUE),
+    Top_5_Genes = paste(Gene[order(-Disruption)][1:5], collapse = ", "),
+    Top_5_Pathways = Top_Pathways %>%
+      str_split(";") %>%               # split multiple pathways
+      unlist() %>%
+      str_trim() %>%                   # remove extra spaces
+      table() %>%
+      sort(decreasing = TRUE) %>%
+      head(5) %>%
+      names() %>%
+      paste(collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  mutate(Normalized_Score = scales::rescale(Total_Disruption_Score, to = c(0, 100)))%>%
+  arrange(desc(Total_Disruption_Score))
+
+write.csv(gene_summary, "summarised_gene_dirruption.csv")
+
+# View or save
+head(gene_summary)
+
+install.packages("writexl")  # if needed
+library(writexl)
+write_xlsx(summary_dyn, "module_pathway_directions.xlsx")
+
+summary_dyn$Clustering_Method <- "Dynamic"
+summary_fixed$Clustering_Method <- "Fixed k=30"
+summary_fixed1$Clustering_Method <- "Fixed k=10"
+
+all_modules_summary <- rbind(summary_dyn, summary_fixed, summary_fixed1)
+write.csv(all_modules_summary, "module_summary_all_methods.csv", row.names = FALSE)
+
+summary_fixed1$Active_Tissue_List <- apply(avg_tstat_fixed1, 1, function(x) {
+  idx <- which(abs(x) > 1.5)
+  if (length(idx) == 0) return(NA)
+  tissues <- names(x)[idx]
+  dirs <- ifelse(x[idx] > 0, "↑", "↓")
+  paste0(tissues, " ", dirs, collapse = ", ")
+})
+
+
+#######################################################
+
+#Plots
+library(ggplot2)
+
+# Example: from summary_dyn
+plot_data <- summary_dyn[!is.na(summary_dyn$Top_MSigDB_Term), ]
+plot_data$Module_ID <- factor(plot_data$Module_ID, levels = plot_data$Module_ID)
+
+ggplot(plot_data, aes(x = Module_ID, y = Top_MSigDB_Term)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top MSigDB Pathway per Module (Dynamic Clustering)",
+       x = "Module", y = "Top Pathway") +
+  theme_minimal(base_size = 12)
+
+
+###################gene-gene network for top module
+library(igraph)
+
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+
+# ---- 1. Focus on top hub/driver genes only ----
+top_module <- "Module 5"
+genes <- modules_dyn[[5]]
+
+# Optional: just top 30 most connected
+conn <- rowSums(abs(cor_matrix[genes, genes]), na.rm = TRUE)
+top_genes <- names(sort(conn, decreasing = TRUE)[1:50])
+sub_cor <- cor_matrix[top_genes, top_genes]
+
+# 2. Threshold: keep only strong edges
+threshold <- 0.75
+sub_cor[abs(sub_cor) < threshold] <- 0
+
+# 3. Keep top 5 connections per gene
+for (i in 1:nrow(sub_cor)) {
+  top_idx <- order(abs(sub_cor[i, ]), decreasing = TRUE)[1:7]
+  sub_cor[i, -top_idx] <- 0
+}
+sub_cor <- (sub_cor + t(sub_cor)) / 2  # symmetrize
+
+# 4. Build network
+g <- graph_from_adjacency_matrix(sub_cor, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+# Annotate nodes
+hub_genes <- strsplit(summary_dyn$Top_Hub_Genes[5], ", ")[[1]]
+driver_gene <- summary_dyn$Driver_Score_Gene[5]
+V(g)$role <- ifelse(V(g)$name == driver_gene, "Driver",
+                    ifelse(V(g)$name %in% hub_genes, "Hub", "Other"))
+
+# 5. Plot with cleaned edges and labeled roles
+network_plot=ggraph(as_tbl_graph(g), layout = "fr") +
+  geom_edge_link(aes(edge_alpha = weight), color = "grey70", show.legend = FALSE) +
+  geom_node_point(aes(color = role), size = 4) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  scale_color_manual(values = c("Driver" = "red", "Hub" = "steelblue", "Other" = "gray60")) +
+  theme_void() +
+  ggtitle(paste("Gene Network Universal Module –", top_module))
+
+# Save as high-resolution PNG
+ggsave("network_plot_module5.png", plot = network_plot, width = 10, height = 8, dpi = 300)
+
+# Optional: Save as vector-quality PDF
+ggsave("network_plot_module5.pdf", plot = network_plot, width = 10, height = 8)
+
+# Top pathway name for the module
+top_pathway <- summary_dyn$Top_MSigDB_Term[5]
+
+# Genes in that pathway
+pathway_genes <- genesets_list[[top_pathway]]
+
+V(g)$pathway <- ifelse(V(g)$name %in% pathway_genes, top_pathway, "Other")
+
+ggraph(as_tbl_graph(g), layout = "fr") +
+  geom_edge_link(aes(edge_alpha = weight), color = "grey70", show.legend = FALSE) +
+  geom_node_point(aes(color = pathway), size = 4) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  theme_void() +
+  ggtitle(paste("Module", top_module, "– Genes in", top_pathway))
+
+V(g)$role <- ifelse(V(g)$name == driver_gene, "Driver",
+                    ifelse(V(g)$name %in% hub_genes, "Hub", "Other"))
+
+ggraph(as_tbl_graph(g), layout = "fr") +
+  geom_edge_link(aes(edge_alpha = weight), color = "grey70", show.legend = FALSE) +
+  geom_node_point(aes(color = pathway, shape = role), size = 4) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+  scale_shape_manual(values = c("Driver" = 17, "Hub" = 16, "Other" = 15)) +
+  theme_void() +
+  ggtitle(paste("Module", top_module, "with MSigDB Pathway Annotation"))
+
+library(igraph)
+write_graph(g, file = "module5.graphml", format = "graphml")
+
+library(umap)
+
+umap_input <- avg_tstat_dyn
+umap_out <- umap::umap(umap_input)
+
+plot(umap_out$layout, col = as.factor(summary_dyn$Direction_Type), 
+     pch = 19, main = "UMAP of Modules by Cross-Tissue Pattern")
+legend("topright", legend = unique(summary_dyn$Direction_Type), col = 1:4, pch = 19)
+
+# Make a data frame with key genes and where they appear
+key_gene_records <- lapply(1:nrow(summary_dyn), function(i) {
+  mod <- summary_dyn$Module_ID[i]
+  pathway <- summary_dyn$Top_MSigDB_Term[i]
+  tissue <- summary_dyn$Top_Tissue[i]
+  genes <- unique(c(strsplit(summary_dyn$Top_Hub_Genes[i], ", ")[[1]], summary_dyn$Driver_Score_Gene[i]))
+  data.frame(Gene = genes, Module = mod, Pathway = pathway, Tissue = tissue, stringsAsFactors = FALSE)
+})
+
+key_gene_df <- do.call(rbind, key_gene_records)
+
+# Convert to binary matrix: Gene × (Tissue + Pathway)
+library(tidyr)
+binary_mat <- key_gene_df %>%
+  mutate(tag = paste(Tissue, Pathway, sep = " – ")) %>%
+  select(Gene, tag) %>%
+  distinct() %>%
+  mutate(present = 1) %>%
+  pivot_wider(names_from = tag, values_from = present, values_fill = 0)
+
+# Plot binary heatmap
+library(ComplexHeatmap)
+Heatmap(as.matrix(binary_mat[,-1]), row_labels = binary_mat$Gene,
+        name = "Presence", col = c("0" = "white", "1" = "black"),
+        cluster_rows = TRUE, cluster_columns = TRUE,
+        show_row_names = TRUE)
+
+#in silico perturbations
+# Perturb a single gene
+perturb_gene <- function(tstatmatrix, gene, type = "knockdown") {
+  perturbed <- tstatmatrix
+  if (gene %in% rownames(tstatmatrix)) {
+    if (type == "knockdown") {
+      perturbed[gene, ] <- 0
+    } else if (type == "overexpress") {
+      perturbed[gene, ] <- perturbed[gene, ] * 2
+    }
+  }
+  return(perturbed)
+}
+
+# Perturb multiple genes
+perturb_combo <- function(tstatmatrix, genes, type = "knockdown") {
+  perturbed <- tstatmatrix
+  for (gene in genes) {
+    if (gene %in% rownames(perturbed)) {
+      perturbed[gene, ] <- if (type == "knockdown") 0 else perturbed[gene, ] * 2
+    }
+  }
+  return(perturbed)
+}
+
+# Recalculate module averages
+recalc_module_means <- function(modules, perturbed_tstats) {
+  sapply(modules, function(genes) {
+    genes <- intersect(genes, rownames(perturbed_tstats))
+    if (length(genes) == 0) return(rep(NA, ncol(perturbed_tstats)))
+    colMeans(perturbed_tstats[genes, , drop = FALSE])
+  })
+}
+
+# Select genes of interest
+summary_fixed$Driver_Score_Gene
+target_genes <- grep("^PCDHG", rownames(tstatmatrix), value = TRUE)
+
+# Get baseline module activity
+baseline_means <- recalc_module_means(modules_dyn, tstatmatrix)
+
+# Run loop for each target gene
+results_list <- list()
+for (gene in target_genes) {
+  perturbed <- perturb_gene(tstatmatrix, gene, "knockdown")
+  perturbed_means <- recalc_module_means(modules_dyn, perturbed)
+  delta <- colSums(abs(perturbed_means - baseline_means), na.rm = TRUE)
+  results_list[[gene]] <- delta
+}
+
+# Combine into data frame
+delta_df <- do.call(rbind, results_list)
+saveRDS(delta_df, "Perturbation_table_pdchg.rds")
+
+# Heatmap of gene-by-module disruption
+pheatmap(delta_df,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         main = "Module Activity Disruption by Gene Perturbation")
+
+# Save to PDF
+pdf("perturbation_heatmap.pdf", width = 10, height = 8)
+pheatmap(delta_df,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         main = "Module Activity Disruption by Gene Perturbation")
+dev.off()
+
+# Get top 5 perturbing genes per module
+top_genes_summary <- apply(delta_df, 2, function(x) head(names(sort(x, decreasing = TRUE)), 5))
+write.csv(top_genes_summary, "top_disruptive_genes_per_module.csv")
+
+combo <- c("PCDHGA9", "EOMES","MIR34B")
+perturbed_combo <- perturb_combo(tstatmatrix, combo, "knockdown")
+combo_means <- recalc_module_means(modules_dyn, perturbed_combo)
+combo_delta <- colSums(abs(combo_means - baseline_means))
+print(combo_delta)
+
+#disrupt multiple genes at once and rank them
+# Assumes tstat_matrix and modules_dyn are already loaded
+baseline_means <- recalc_module_means(modules_dyn, tstatmatrix)
+
+# Create output matrix
+disruption_scores <- matrix(NA, nrow = nrow(tstatmatrix), ncol = length(modules_dyn))
+rownames(disruption_scores) <- rownames(tstatmatrix)
+colnames(disruption_scores) <- names(modules_dyn)
+
+for (i in 1:nrow(tstatmatrix)) {
+  gene <- rownames(tstatmatrix)[i]
+  perturbed <- tstatmatrix
+  perturbed[gene, ] <- 0
+  
+  perturbed_means <- recalc_module_means(modules_dyn, perturbed)
+  delta <- colSums(abs(perturbed_means - baseline_means), na.rm = TRUE)
+  disruption_scores[gene, ] <- delta
+}
+
+# Sum total disruption across modules
+total_disruption <- rowSums(disruption_scores, na.rm = TRUE)
+
+# Rank genes
+top_impact_genes <- sort(total_disruption, decreasing = TRUE)
+top_impact_genes2=data.frame(Gene = names(top_impact_genes), TotalDisruption = top_impact_genes)
+
+write.csv(data.frame(Gene = names(top_impact_genes), TotalDisruption = top_impact_genes),
+          "top_global_disruptors.csv")
+
+library(pheatmap)
+
+# Subset top N genes
+heat_data <- disruption_scores[names(top_impact_genes), ]
+pheatmap(heat_data, main = "Top Gene Knockdowns – Module Disruption", cluster_cols = TRUE)
+
+# Save
+pdf("global_disruptors_heatmap.pdf", width = 10, height = 8)
+pheatmap(heat_data, main = "Top Gene Knockdowns – Module Disruption", cluster_cols = TRUE)
+dev.off()
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(msigdb)  # or use msigdbr if installed
+library(tibble)
+
+symbol_to_entrez <- function(symbols) {
+  suppressMessages(
+    bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)$ENTREZID
+  )
+}
+
+# Run enrichment for all modules
+# Load required libraries
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+
+# Create list to store enrichment results
+enrichment_list <- list()
+genesets_df <- stack(genesets2)
+colnames(genesets_df) <- c("gene", "term")  # reverse stack() order
+genesets_df <- genesets_df[, c("term", "gene")]
+
+# Output directory (same as created in Python)
+output_dir <- "//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs/enrichment_results_all_tissues/"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Initialize list to store results
+enrichment_list <- list()
+
+# Loop through modules
+run_full_go_list <- function(modules, genesets_df, min_genes = 10) {
+  all_results <- list()
+  
+  for (i in seq_along(modules)) {
+    mod_name <- paste0("Module_", i)
+    genes <- modules[[i]]
+    
+    if (length(genes) < min_genes) {
+      all_results[[mod_name]] <- NA
+      next
+    }
+    
+    res <- suppressMessages(enricher(gene = genes, TERM2GENE = genesets_df, pAdjustMethod = "BH"))
+    
+    if (!is.null(res) && nrow(res@result) > 0) {
+      all_results[[mod_name]] <- res@result
+    } else {
+      all_results[[mod_name]] <- NA
+    }
+  }
+  
+  return(all_results)
+}
+
+# Re-run
+enrichment_list <- run_full_go_list(modules_dyn, genesets_df)
+
+summary_df <- data.frame(Module = character(), Top_Pathways = character())
+
+for (mod in names(enrichment_list)) {
+  res <- enrichment_list[[mod]]
+  top_paths <- if (is.data.frame(res)) paste(head(res$Description, 5), collapse = "; ") else NA
+  summary_df <- rbind(summary_df, data.frame(Module = mod, Top_Pathways = top_paths))
+}
+
+write.csv(summary_df, "enrichment_summary_fixed_all_tissues.csv", row.names = FALSE)
+
+# Load required packages
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+
+# Load your previously saved data
+top_perturb <- top_impact_genes2  # Re-upload and use correct filename
+enrichment_results <- summary_df # assuming you saved it earlier
+
+flat_enrichment <- enrichment_results
+
+# Define thresholds (can be tweaked)
+high_disruption <- quantile(top_perturb$TotalDisruption, 0.95)
+low_disruption  <- quantile(top_perturb$TotalDisruption, 0.05)
+
+# Assign beneficial vs harmful based on effect direction (you may use actual biology here)
+# For now assume: disrupting modules with "AGE" or "SENESCENCE" is beneficial
+flat_enrichment$Effect <- ifelse(
+  grepl("AGE|SENESCENCE|INFLAMMATION|DEGENERATION", flat_enrichment$Top_Pathways, ignore.case = TRUE),
+  "Beneficial", "Harmful"
+)
+
+# Melt disruption matrix to long format
+long_disruption <- melt(disruption_scores)
+colnames(long_disruption) <- c("Gene", "Module", "Disruption")
+
+# Merge pathway annotation
+long_disruption <- long_disruption %>%
+  mutate(Module = paste0("Module_", Module)) %>%
+  left_join(flat_enrichment, by = "Module")
+
+# Add effect labels
+long_disruption$Effect[is.na(long_disruption$Effect)] <- "Unknown"
+
+# Save master table
+write.csv(long_disruption, "full_gene_module_disruption_annotated.csv", row.names = FALSE)
+
+# Count how many modules each gene disrupts significantly
+disruption_binary <- disruption_scores > 1.0  # You can adjust the cutoff
+cross_module_count <- rowSums(disruption_binary)
+
+# Add to gene metadata
+gene_metadata <- data.frame(
+  Gene = rownames(disruption_scores),
+  ModulesDisrupted = cross_module_count
+)
+
+# Label as cross-tissue if disrupting >5 modules
+gene_metadata$TissueScope <- ifelse(gene_metadata$ModulesDisrupted > 5, "Cross-Tissue", "Tissue-Specific")
+
+# Join with top_perturb
+gene_metadata <- left_join(gene_metadata, top_perturb, by = "Gene")
+
+# Subset top 50 disruptors
+top50 <- top_perturb %>%
+  arrange(desc(TotalDisruption)) %>%
+  slice(1:50) %>%
+  pull(Gene)
+
+heat_data <- disruption_scores[top50, ]
+Heatmap(
+  heat_data,
+  name = "Disruption",
+  col = colorRamp2(c(0, max(heat_data)), c("white", "red")),
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  show_row_names = TRUE,
+  show_column_names = FALSE
+)
+
+# Merge top genes with effect types
+effect_summary <- long_disruption %>%
+  filter(Gene %in% top50) %>%
+  group_by(Gene, Effect) %>%
+  summarise(AvgDisruption = mean(Disruption, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(effect_summary, aes(x = reorder(Gene, -AvgDisruption), y = AvgDisruption, fill = Effect)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Disruption of Modules by Top Genes", x = "Gene", y = "Average Disruption Score") +
+  scale_fill_manual(values = c("Beneficial" = "steelblue", "Harmful" = "darkred", "Unknown" = "gray60")) +
+  theme_minimal()
+
+ggplot(gene_metadata, aes(x = ModulesDisrupted, y = TotalDisruption, color = TissueScope)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Cross-Tissue" = "darkgreen", "Tissue-Specific" = "purple")) +
+  labs(title = "Cross-Module Disruption vs Total Impact",
+       x = "Modules Disrupted", y = "Total Disruption Score") +
+  theme_bw()
