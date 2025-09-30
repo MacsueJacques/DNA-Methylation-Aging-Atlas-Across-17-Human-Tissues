@@ -1,0 +1,975 @@
+####WGCNA analysis one tissue at a time to start with ####
+setwd("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration")
+
+brain_dir <- "//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/Brain/Beta and pheno"
+
+all_files <- list.files(brain_dir, pattern = "\\.txt$", full.names = TRUE)
+length(all_files)  # should be ~40
+
+head(basename(all_files), 10)
+
+#This step is only needed if some pheno files were saved as .txt
+#beta_files <- all_files[grepl("beta", all_files, ignore.case = TRUE)]
+#pheno_files <- all_files[grepl("pheno", all_files, ignore.case = TRUE)]
+
+beta_files <- all_files[grepl(".txt", all_files, ignore.case = TRUE)]
+pheno_files <- list.files(brain_dir, pattern = "\\.csv$", full.names = TRUE)
+
+#lenght should be the same check
+length(beta_files); length(pheno_files)
+
+# Read example beta and pheno
+test_beta <- read.table(beta_files[1], header = TRUE, row.names = 1, check.names = FALSE)
+test_pheno <- read.csv(pheno_files[1], header = TRUE, check.names = FALSE)
+
+# Inspect
+dim(test_beta)   # e.g., 362837 CpGs × 22 samples
+head(test_beta[, 1:3])
+head(test_pheno)
+
+#Load significant cpgs
+brain_sig_cpgs=read.csv("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs/Brain_DMPs.csv")
+brain_sig_cpgs=brain_sig_cpgs$MarkerName
+
+#Loop over datasets and combine
+library(tidyverse)
+
+combined_beta_list <- list()
+combined_pheno_list <- list()
+
+for (i in seq_along(beta_files)) {
+  cat("Processing dataset:", basename(beta_files[i]), "\n")
+  
+  # Load beta and pheno
+  beta <- read.table(beta_files[i], header = TRUE, row.names = 1, check.names = FALSE)
+  pheno <- read.csv(pheno_files[i], header = TRUE, check.names = FALSE)
+  
+  # Sample ID matching
+  beta_samples <- colnames(beta)
+  pheno_samples <- pheno$Sample_Name
+  
+  # Filter pheno to samples present in beta
+  pheno <- pheno[pheno$Sample_Name%in%beta_samples,]
+  
+  # Filter beta to match pheno (and in exact same order)
+  beta <- beta[, pheno$Sample_Name, drop = FALSE]
+  
+  # Confirm order matches
+  stopifnot(all(pheno$Sample_Name == colnames(beta)))
+  
+  # Filter beta to include only significant CpGs
+  common_cpgs <- intersect(rownames(beta), brain_sig_cpgs)
+  beta <- beta[common_cpgs, , drop = FALSE]
+  
+  # Store
+  combined_beta_list[[i]] <- beta
+  combined_pheno_list[[i]] <- pheno
+}
+
+saveRDS(combined_beta_list, "combined_DMPs_list.rds")
+saveRDS(combined_pheno_list, "combined_pheno_list.rds")
+
+combined_beta_list=readRDS("combined_DMPs_list_Brain.rds")
+combined_pheno_list=readRDS("combined_pheno_list_Brain.rds")
+
+# Combine across datasets
+library(dplyr)
+
+# Convert matrices to data frames and keep CpG rownames as a column
+beta_dfs <- lapply(combined_beta_list, function(b) {
+  b_df <- as.data.frame(b)
+  b_df$CpG <- rownames(b)
+  b_df
+})
+
+# Merge all by CpG
+brain_beta_combined <- Reduce(function(x, y) full_join(x, y, by = "CpG"), beta_dfs)
+
+# Restore CpG rownames
+rownames(brain_beta_combined) <- brain_beta_combined$CpG
+brain_beta_combined$CpG <- NULL
+
+# Convert back to matrix
+brain_beta_combined <- as.matrix(brain_beta_combined)
+saveRDS(brain_beta_combined, "brain_beta_combined.rds")
+
+
+combined_pheno_list <- list()
+
+for (i in seq_along(pheno_files)) {
+  cat("Loading pheno:", basename(pheno_files[i]), "\n")
+  
+  pheno <- read.csv(pheno_files[i])  # fill missing columns if needed
+  
+  # Sanitize column names
+  colnames(pheno) <- make.names(colnames(pheno), unique = TRUE)
+  
+  # Identify the sample name and age columns
+  sample_col <- grep("Sample_Name", colnames(pheno), ignore.case = TRUE, value = TRUE)[1]
+  age_col <- grep("age", colnames(pheno), ignore.case = TRUE, value = TRUE)[1]
+  
+  if (is.na(sample_col) || is.na(age_col)) {
+    warning("Skipping file — missing 'Sample_Name' or 'Age' columns:", basename(pheno_files[i]))
+    next
+  }
+  
+  cleaned_pheno <- pheno %>%
+    select(Sample_Name = all_of(sample_col), age = all_of(age_col)) %>%
+    mutate(Sample_Name = as.character(Sample_Name),
+           age = as.numeric(age))
+  
+  combined_pheno_list[[i]] <- cleaned_pheno
+}
+
+brain_pheno_combined <- bind_rows(combined_pheno_list) %>%
+  distinct(Sample_Name, .keep_all = TRUE)
+
+colnames(brain_beta_combined) <- sub("_.*", "", colnames(brain_beta_combined))
+
+brain_pheno_combined <- brain_pheno_combined %>%
+  mutate(Sample_Name = sub("_.*", "", Sample_Name))
+
+# Filter and reorder again
+brain_pheno_combined <- brain_pheno_combined %>%
+  filter(Sample_Name %in% colnames(brain_beta_combined)) %>%
+  arrange(match(Sample_Name, colnames(brain_beta_combined)))
+
+# Final safety check
+stopifnot(all(brain_pheno_combined$Sample_Name == colnames(brain_beta_combined)))
+
+saveRDS(brain_pheno_combined, "brain_pheno_combined.rds")
+
+#### WGCNA ####
+library(WGCNA)
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+
+#transpose matrix
+datExpr <- t(brain_beta_combined)  # samples x CpGs
+sum(is.na(datExpr))  # total NA count
+
+#filter CpGs with too many missing values
+na_per_cpg <- rowMeans(is.na(brain_beta_combined))
+summary(na_per_cpg)
+
+# Set cutoff: remove CpGs with >25% missing values
+beta_filtered <- brain_beta_combined[na_per_cpg <= 0.25, ]
+dim(beta_filtered)
+
+#Remove samples with too many missing values
+na_per_sample <- colMeans(is.na(beta_filtered))
+summary(na_per_sample)
+
+# Remove samples with >10% missing CpGs
+beta_filtered <- beta_filtered[, na_per_sample <= 0.10]
+dim(beta_filtered)
+
+beta_filtered2 <- beta_filtered[complete.cases(beta_filtered), ]
+dim(beta_filtered2)
+
+datExpr <- t(beta_filtered2)
+
+#Step-by-Step Variance Filtering
+cpg_variances <- apply(datExpr, 2, var, na.rm = TRUE)
+summary(cpg_variances)
+
+var_threshold <- quantile(cpg_variances, probs = 0.20, na.rm = TRUE)
+
+datExpr_filtered <- datExpr[, cpg_variances > var_threshold]
+dim(datExpr_filtered)
+
+sum(is.na(datExpr_filtered))  # should be 0
+
+saveRDS(datExpr_filtered, file = "brain_WGCNA_beta_filtered.rds")
+datExpr_filtered <- readRDS("brain_WGCNA_beta_filtered.rds")
+
+library(WGCNA)
+
+# Make sure multi-threading is allowed
+allowWGCNAThreads()
+
+#Run pickSoftThreshold
+#We'll test a range of powers to identify the lowest value where:
+#Scale-free topology fit index (R²) reaches at least 0.8 
+#(ideally)
+#Mean connectivity remains acceptable
+
+powers <- c(seq(1, 10, by = 1), seq(12, 30, by = 2))
+
+sft <- pickSoftThreshold(datExpr_filtered,
+                         powerVector = powers,
+                         verbose = 5,
+                         networkType = "signed",  # or "unsigned" depending on your goals
+                         corFnc = "bicor",        # or "pearson"
+                         corOptions = list(maxPOutliers = 0.1))
+saveRDS(sft, file = "brain_WGCNA_sft.rds")
+
+sft <- readRDS("brain_WGCNA_sft.rds")
+
+
+#Visualize Results
+par(mfrow = c(1, 2))
+
+# Plot 1: Scale-free fit index (R²)
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit (R²)",
+     type="n", main = "Scale Independence")
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, col="blue")
+abline(h=0.8, col="red")  # desired R² threshold
+
+# Plot 2: Mean connectivity
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)", ylab="Mean Connectivity",
+     type="n", main = "Mean Connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, col="blue")
+
+# Define output path
+tiff("brain_WGCNA_soft_threshold.tiff", width = 2400, height = 1200, res = 300)
+par(mfrow = c(1, 2))
+
+# Plot 1: Scale-free topology model fit
+plot(sft$fitIndices[,1], 
+     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     xlab = "Soft Threshold (Power)", 
+     ylab = "Scale Free Topology Model Fit (R²)", 
+     type = "n", 
+     main = "Scale Independence")
+text(sft$fitIndices[,1], 
+     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     labels = powers, col = "blue")
+abline(h = 0.8, col = "red", lty = 2)
+
+# Plot 2: Mean connectivity
+plot(sft$fitIndices[,1], 
+     sft$fitIndices[,5],
+     xlab = "Soft Threshold (Power)", 
+     ylab = "Mean Connectivity", 
+     type = "n", 
+     main = "Mean Connectivity")
+text(sft$fitIndices[,1], 
+     sft$fitIndices[,5], 
+     labels = powers, col = "blue")
+
+dev.off()
+
+####plot explanation
+#Plot 1: Scale-Free Topology Fit (R²)
+#This shows a steady increase in R² as power increases.
+#Around power = 14–16, R² crosses the threshold of 0.8, 
+#which is the commonly accepted cutoff for scale-free topology.
+
+#The increase continues beyond that, but with diminishing 
+#returns — it starts flattening out around 16–18.
+
+#Plot 2: Mean Connectivity
+#As expected, mean connectivity decreases with higher powers.
+#At power = 14, the mean connectivity is still reasonable — 
+#not too sparse.
+
+#Beyond 18, the network becomes increasingly sparse, which can
+#reduce sensitivity in module detection.
+
+softPower <- 14  # ← Replace this with your actual chosen power
+
+net <- blockwiseModules(datExpr_filtered,
+                        power = softPower,
+                        networkType = "signed",
+                        corType = "bicor",
+                        maxBlockSize = 50000,  # Good default for methylation
+                        TOMType = "signed",
+                        minModuleSize = 30,
+                        reassignThreshold = 0,
+                        mergeCutHeight = 0.25,
+                        numericLabels = TRUE,
+                        pamRespectsDendro = FALSE,
+                        saveTOMs = TRUE,
+                        saveTOMFileBase = "brain_TOM",
+                        verbose = 3)
+saveRDS(net, file = "brain_WGCNA_network.rds")
+
+net=readRDS("brain_WGCNA_network.rds")
+
+# Plot dendrogram + module colors
+#Shows how CpGs clustered into modules
+#Colored bar underneath represents module membership (e.g., blue, turquoise, brown)
+# Get ordered names from dendrogram
+module_order <- net$blockGenes[[1]]  # indices of CpGs in block 1
+cpg_names_ordered <- colnames(datExpr_filtered)[module_order]
+
+# Match to colors
+color_vector <- labels2colors(net$colors[module_order])
+
+# Plot with corrected order
+tiff("brain_WGCNA_dendrogram_fixed.tiff", width = 2400, height = 1200, res = 300)
+
+plotDendroAndColors(dendro = net$dendrograms[[1]], 
+                    colors = color_vector,
+                    groupLabels = "Module colors",
+                    dendroLabels = FALSE,
+                    hang = 0.03,
+                    addGuide = TRUE,
+                    guideHang = 0.05)
+
+dev.off()
+
+#The Plot:
+  #Top part: A dendrogram (tree) of CpGs — this is a 
+#hierarchical clustering of CpGs based on how similarly they behave (co-methylate) across your samples.
+
+#Bottom colored bar: Shows the module assignment for each CpG 
+#each color represents a module (a group of co-methylated CpGs).
+
+#CpGs that cluster together have very similar methylation 
+#profiles across your samples.
+
+#WGCNA cuts this tree into branches (using dynamic tree cut), 
+#grouping similar CpGs into modules.
+
+#Inspect Module Sizes
+#Quantify how many CpGs belong to each module
+#Helps identify large, robust modules vs. small, noisy ones
+
+# Count CpGs per module
+module_sizes <- table(net$colors)
+
+# Print sorted module sizes
+module_sizes <- sort(module_sizes, decreasing = TRUE)
+print(module_sizes)
+
+# Save to file
+write.table(module_sizes, "brain_module_sizes.txt", sep = "\t", quote = FALSE, col.names = NA)
+
+#identify age associated modules using eigengene
+#prepare data
+brain_pheno_combined <- readRDS("brain_pheno_combined.rds")
+
+# Ensure matching order between trait and expression
+traitData <- brain_pheno_combined %>%
+  filter(Sample_Name %in% rownames(datExpr_filtered)) %>%
+  arrange(match(Sample_Name, rownames(datExpr_filtered)))
+
+stopifnot(all(traitData$Sample_Name == rownames(datExpr_filtered)))
+
+#compute modules
+moduleEigengenes <- net$MEs  # module eigengenes
+moduleTraitCor <- cor(moduleEigengenes, traitData$age, use = "pairwise.complete.obs")
+moduleTraitP <- corPvalueStudent(moduleTraitCor, nrow(datExpr_filtered))
+
+# Save
+write.csv(moduleTraitCor, "brain_module_trait_cor.csv")
+write.csv(moduleTraitP, "brain_module_trait_p.csv")
+
+#Plot trait heatmap
+library(pheatmap)
+
+text_matrix <- paste0(signif(moduleTraitCor, 2), "\n(p=", signif(moduleTraitP, 1), ")")
+
+rownames(moduleTraitCor) <- colnames(moduleEigengenes)
+colnames(moduleTraitCor) <- "Age"
+
+tiff("brain_module_trait_heatmap.tiff", width = 1200, height = 800, res = 300)
+pheatmap(moduleTraitCor,
+         display_numbers = matrix(text_matrix, 
+                                  nrow = nrow(moduleTraitCor), 
+                                  ncol = ncol(moduleTraitCor),
+                                  dimnames = dimnames(moduleTraitCor)),
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Brain Module–Age Correlation")
+dev.off()
+
+library(ggplot2)
+
+df_plot <- data.frame(
+  Module = rownames(moduleTraitCor),
+  Correlation = moduleTraitCor[,1],
+  P = moduleTraitP[,1]
+)
+
+df_plot$Module <- factor(df_plot$Module, levels = df_plot$Module[order(df_plot$Correlation)])
+df_plot$Significance <- ifelse(df_plot$P < 0.05, "p < 0.05", "ns")
+
+ggplot(df_plot, aes(x = Module, y = Correlation, fill = Correlation)) +
+  geom_col(color = "black") +
+  coord_flip() +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", 
+                       midpoint = 0, limits = c(-0.5,0.5), 
+                       name = "Corr with Age") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold", size = 16),
+        axis.title = element_text(face = "bold", size = 14)) +
+  labs(title = "Brain Module–Age Correlation",
+       x = "Module", y = "Correlation with Age")
+
+###########Comments about how to interpret plot above############
+What This Plot Shows
+Each bar represents a WGCNA module (e.g., ME17, ME24, etc.)
+
+The length and direction of the bar shows the correlation between that module’s eigengene (summary profile of the module) and age
+
+The color shows statistical significance:
+
+  Red positive and sig, blue negative and sig and ME8 is the only one not significant.
+  
+✅ What You Can Immediately See
+🟥 Positive associations:
+  Modules like ME17, ME24, ME27, ME25, ME7 are significantly positively correlated with age
+
+This means: samples with higher age tend to have higher average methylation in these modules
+
+These modules might represent hypermethylation with age in the brain
+
+🟦 Negative associations:
+  Modules like ME5 and ME11 are negatively correlated with age and significant
+
+This suggests hypomethylation in these CpG modules with increasing age
+
+These could be markers of age-related loss of methylation in regulatory elements
+
+❗ ME8 is borderline:
+  Has a mild negative correlation with age but isn’t statistically significant (p ≥ 0.05) — still possibly interesting
+
+🧠 How to Use This
+Prioritize ME17, ME24, ME27, ME5, and ME11
+
+These show the strongest and most significant relationships
+
+You can extract CpGs from these modules for:
+  
+  Hub CpG analysis
+
+Mapping to genes
+
+GO/KEGG enrichment
+
+Cross-tissue comparisons
+
+Direction matters:
+  
+  You may observe:
+  
+  Inflammatory or stress pathways upregulated in positively correlated modules
+
+Neuronal function or epigenetic silencing modules downregulated in negatively correlated ones
+
+Further steps:
+  
+  Pull hub CpGs from ME17, ME24, ME11, and ME5
+
+Run enrichment separately for:
+  
+  Positively age-associated modules
+
+Negatively age-associated modules
+#######################
+#Map CpGs in Significant Modules to genes
+
+#load annotation and filter modules
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+# 1. Get significant modules from correlation analysis
+sig_modules <- rownames(moduleTraitP)[moduleTraitP[, 1] < 0.05]  # e.g., "ME7", "ME24"
+
+# 2. Extract numeric module labels (e.g., 7, 24)
+sig_module_numbers <- as.numeric(gsub("ME", "", sig_modules))
+
+# 3. Extract CpGs from those modules
+cpgs_in_sig_modules <- names(net$colors)[net$colors %in% sig_module_numbers]
+
+# 4. Make a data frame mapping CpGs to module
+module_df <- data.frame(
+  CpG = cpgs_in_sig_modules,
+  Module = net$colors[match(cpgs_in_sig_modules, names(net$colors))]
+)
+
+# Optional: convert module numbers to "ME" format for consistency
+module_df$ModuleLabel <- paste0("ME", module_df$Module)
+
+# Join with annotation
+setwd("//ad.monash.edu/home/User050/mjac0029/Desktop/Integration/DMPs")
+module_annotated <- merge(module_df, anno, by.x = "CpG", by.y = "Name")
+
+saveRDS(module_annotated, "module_annotated_list_brain.rds")
+
+# Ensure annotation has CpG names as rownames
+anno_df <- as.data.frame(anno)
+anno_df$CpG <- rownames(anno_df)
+
+# Merge with module_df
+module_annotated <- merge(module_df, anno_df, by = "CpG")
+
+# Save
+write.csv(module_annotated, "brain_sig_modules_annotated.csv", row.names = FALSE)
+
+#Extract gene symbols by module
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(tidyverse)
+
+# Clean and split UCSC gene names
+extract_genes_by_module <- function(mod) {
+  module_annotated %>%
+    filter(ModuleLabel == mod) %>%
+    pull(UCSC_RefGene_Name) %>%
+    str_split(";") %>%
+    unlist() %>%
+    unique() %>%
+    .[. != ""]
+}
+
+# Get list of all significant modules
+sig_module_labels <- unique(module_annotated$ModuleLabel)
+
+# Create named list of gene vectors
+gene_lists <- lapply(sig_module_labels, extract_genes_by_module)
+names(gene_lists) <- sig_module_labels
+
+#Run enrichment for each module
+enrich_results <- list()
+
+for (mod in names(gene_lists)) {
+  cat("Running enrichment for", mod, "...\n")
+  gene_vec <- gene_lists[[mod]]
+  
+  if (length(gene_vec) >= 10) {  # minimum for enrichGO
+    ego <- enrichGO(gene         = gene_vec,
+                    OrgDb        = org.Hs.eg.db,
+                    keyType      = "SYMBOL",
+                    ont          = "BP",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff  = 0.05,
+                    readable     = TRUE)
+    
+    enrich_results[[mod]] <- ego
+    write.csv(as.data.frame(ego), paste0("GO_BP_enrichment_", mod, ".csv"), row.names = FALSE)
+  } else {
+    message("Skipping ", mod, " (fewer than 10 unique genes)")
+  }
+}
+
+#Combine all enrichment results into one table
+# Combine all enrichGO outputs into one table
+combined_enrichment <- purrr::map2_df(
+  enrich_results,
+  names(enrich_results),
+  ~ as.data.frame(.x) %>% mutate(Module = .y),
+  .id = "ListID"
+)
+
+# Save as CSV
+write.csv(combined_enrichment, "brain_GO_BP_enrichment_combined_WGCNA.csv", row.names = FALSE)
+
+# Define a threshold for positive vs negative age association
+pos_modules <- rownames(moduleTraitCor)[moduleTraitCor[,1] > 0.10 & moduleTraitP[,1] < 0.05]
+neg_modules <- rownames(moduleTraitCor)[moduleTraitCor[,1] < -0.10 & moduleTraitP[,1] < 0.05]
+
+# Check what's in them
+print(pos_modules)
+print(neg_modules)
+
+# Top terms (5 per module) for positive modules
+top_pos <- combined_enrichment %>%
+  filter(Module %in% pos_modules) %>%
+  group_by(Module) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  mutate(Direction = "Positive")
+
+# Top terms (5 per module) for negative modules
+top_neg <- combined_enrichment %>%
+  filter(Module %in% neg_modules) %>%
+  group_by(Module) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  mutate(Direction = "Negative")
+
+top_pos <- top_pos %>% mutate(Description = stringr::str_wrap(Description, width = 45))
+
+tiff("GO_Positive_Modules.tiff", width = 15, height = 10, units = "in", res = 600, bg = "white")
+ggplot(top_pos, aes(x = -log10(p.adjust), 
+                    y = fct_reorder(Description, -p.adjust),
+                    fill = Module)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Module, scales = "free_y") +
+  labs(title = "GO Enrichment: Positively Age-Associated Modules",
+       x = "-log10 Adjusted P-value",
+       y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 16, face = "bold")) +
+  scale_fill_viridis_d()
+dev.off()
+
+top_neg <- top_neg %>% mutate(Description = stringr::str_wrap(Description, width = 45))
+
+tiff("GO_Negative_Modules.tiff", width = 15, height = 10, units = "in", res = 600, bg = "white")
+ggplot(top_neg, aes(x = -log10(p.adjust), 
+                    y = fct_reorder(Description, -p.adjust),
+                    fill = Module)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Module, scales = "free_y") +
+  labs(title = "GO Enrichment: Negatively Age-Associated Modules",
+       x = "-log10 Adjusted P-value",
+       y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 16, face = "bold")) +
+  scale_fill_viridis_d()
+dev.off()
+
+######################################
+Let’s now dive into comparing the genes driving enrichment in positively vs negatively age-associated modules, followed by dot plot and network-style visualizations. This will give you insight into:
+  
+1) Which biological processes are shared vs unique across modules
+
+2) Which genes are driving these enrichments
+######################################
+# List of modules with positive and negative age correlations
+positive_modules <- rownames(moduleTraitCor)[moduleTraitCor[,1] > 0.10 & moduleTraitP[,1] < 0.05]
+negative_modules <- rownames(moduleTraitCor)[moduleTraitCor[,1] < -0.10 & moduleTraitP[,1] < 0.05]
+
+# Annotated CpGs with genes (from earlier)
+library(dplyr)
+
+genes_by_module <- module_annotated %>%
+  filter(ModuleLabel %in% c(positive_modules, negative_modules)) %>%
+  dplyr::select(ModuleLabel, UCSC_RefGene_Name)
+
+# Split genes, remove duplicates and blanks
+genes_by_module <- genes_by_module %>%
+  mutate(Gene = strsplit(UCSC_RefGene_Name, ";")) %>%
+  tidyr::unnest(Gene) %>%
+  filter(Gene != "") %>%
+  distinct()
+
+# Add direction label
+genes_by_module <- genes_by_module %>%
+  mutate(Direction = ifelse(ModuleLabel %in% positive_modules, "Positive", "Negative"))
+
+head(genes_by_module)
+
+#Compare top driving genes
+library(forcats)
+
+top_driver_genes <- genes_by_module %>%
+  group_by(Direction, Gene) %>%
+  summarise(Frequency = n(), Modules = paste(unique(ModuleLabel), collapse = ",")) %>%
+  arrange(Direction, desc(Frequency)) %>%
+  group_by(Direction) %>%
+  slice_max(order_by = Frequency, n = 20)
+
+write.csv(top_driver_genes, "brain_top_driver_genes_by_direction.csv", row.names = FALSE)
+
+#visualise as dot plot
+library(ggplot2)
+
+tiff("brain_top_driver_genes_dotplot.tiff", width = 15, height = 10, units = "in", res = 600, bg = "white")
+ggplot(top_driver_genes, aes(x = Frequency, y = fct_reorder(Gene, Frequency), color = Direction)) +
+  geom_point(size = 4) +
+  facet_wrap(~Direction, scales = "free") +
+  labs(title = "Top Genes Driving Enrichment in Age-Associated Modules",
+       x = "Number of Modules",
+       y = NULL) +
+  scale_color_manual(values = c("Positive" = "#b2182b", "Negative" = "#2166ac")) +
+  theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(size = 16, face = "bold"))
+dev.off()
+
+#Visualise as Gene_GO termn network map
+library(enrichplot)
+
+# Use enrichResult object (e.g., ego_pos)
+genes_in_network <- ego_pos@result %>%
+  slice_head(n = 10) %>%           # top 10 enriched terms
+  pull(geneID) %>%                 # extract geneID column
+  strsplit("/") %>%
+  unlist() %>%
+  unique()
+
+# Filter your annotated gene-module table
+gene_module_map <- module_annotated %>%
+  filter(grepl(paste(genes_in_network, collapse = "|"), UCSC_RefGene_Name)) %>%
+  mutate(Gene = strsplit(UCSC_RefGene_Name, ";")) %>%
+  tidyr::unnest(Gene) %>%
+  filter(Gene %in% genes_in_network) %>%
+  distinct(Gene, ModuleLabel)
+
+# Create named color vector
+library(colorspace)
+
+modules <- unique(gene_module_map$ModuleLabel)
+color_palette <- qualitative_hcl(length(modules), palette = "Dark 3")
+
+names(color_palette) <- modules
+
+gene_colors <- gene_module_map$ModuleLabel
+names(gene_colors) <- gene_module_map$Gene
+
+# Final color mapping vector
+fold_colors <- color_palette[gene_colors]
+
+# Create numeric values for modules
+module_ids <- setNames(seq_along(modules), modules)
+
+# Map module labels to numeric values
+fold_numeric <- module_ids[gene_colors]  # numeric, names = gene names
+
+library(enrichplot)
+
+tiff("brain_GO_network_pos.tiff", width = 12, height = 8, units = "in", res = 300)
+
+cnetplot(ego_pos,
+         showCategory = 10,
+         foldChange = fold_numeric,
+         node_label = "all",
+         circular = TRUE,
+         layout = "kk",
+         colorEdge = TRUE) +
+  scale_fill_manual(values = color_palette) +
+  ggtitle("GO Network: Genes Colored by Module (Numeric IDs)")
+
+dev.off()
+
+#lets try another way
+library(dplyr)
+library(tidyr)
+
+# Your enriched results (e.g., ego_pos or enrich_results)
+# We'll extract the top GO terms and their genes
+extract_network_data <- function(ego, top_n = 10, module_label) {
+  ego@result %>%
+    slice_head(n = top_n) %>%
+    dplyr::select(ID, Description, geneID) %>%
+    mutate(Module = module_label) %>%
+    separate_rows(geneID, sep = "/") %>%
+    rename(GO_ID = ID, GO_term = Description, Gene = geneID)
+}
+
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+
+# Pull top 5 terms for ME17
+net_df <- extract_network_data(ego = enrich_results[["ME7"]], top_n = 10, module_label = "ME7")
+
+# Build edge list
+edges <- net_df %>% dplyr::select(GO_term, Gene)
+nodes <- unique(c(edges$GO_term, edges$Gene))
+
+# Assign types
+node_df <- data.frame(name = nodes,
+                      type = ifelse(nodes %in% net_df$GO_term, "GO", "Gene"))
+
+# Build graph
+g <- graph_from_data_frame(d = edges, vertices = node_df, directed = FALSE)
+
+# Plot
+ggraph(g, layout = "fr") +
+  geom_edge_link(color = "grey70") +
+  geom_node_point(aes(color = type), size = 6) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3.5) +
+  scale_color_manual(values = c("GO" = "#8da0cb", "Gene" = "#66c2a5"), alpha=0.5) +
+  theme_void() +
+  ggtitle("Module-Specific Network: ME7")
+
+##### multiple modules
+# Choose modules to include (you can change this list)
+modules_to_include <- c("ME12", "ME16", "ME6", "ME7", "ME9")
+
+# Combine data across modules
+multi_net <- purrr::map_df(modules_to_include, ~{
+  extract_network_data(enrich_results[[.x]], top_n = 5, module_label = .x)
+})
+
+# Build edges
+edges_multi <- multi_net %>% dplyr::select(GO_term, Gene)
+nodes_multi <- unique(c(edges_multi$GO_term, edges_multi$Gene))
+
+# Add node type and module info
+node_df_multi <- data.frame(
+  name = nodes_multi,
+  type = ifelse(nodes_multi %in% multi_net$GO_term, "GO", "Gene")
+)
+
+# Add module coloring for genes
+gene_module_map <- multi_net %>%
+  dplyr::select(Gene, Module) %>%
+  distinct() %>%
+  filter(Gene %in% node_df_multi$name)
+
+node_df_multi$Module <- ifelse(node_df_multi$type == "GO", "GO", gene_module_map$Module[match(node_df_multi$name, gene_module_map$Gene)])
+
+# Colors
+modules <- unique(na.omit(node_df_multi$Module))
+mod_colors <- RColorBrewer::brewer.pal(max(3, length(modules)), "Set2")
+names(mod_colors) <- modules
+mod_colors <- c(mod_colors, "GO" = "#999999")  # grey for GO terms
+
+# Build graph
+g_multi <- graph_from_data_frame(d = edges_multi, vertices = node_df_multi, directed = FALSE)
+
+# Plot
+ggraph(g_multi, layout = "fr") +
+  geom_edge_link(color = "grey80") +
+  geom_node_point(aes(color = Module), size = 6) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 3.2) +
+  scale_color_manual(values = mod_colors) +
+  theme_void() +
+  ggtitle("GO–Gene Network: Multiple Age-Associated Modules")
+
+###### still improving visualy to label only driver genes
+# Top 20 most frequent genes per direction (positive/negative)
+driver_genes <- top_driver_genes$Gene
+
+library(ggplot2)
+library(ggraph)
+library(igraph)
+
+# Add driver status
+node_df_multi <- node_df_multi %>%
+  mutate(is_driver = ifelse(name %in% driver_genes, TRUE, FALSE))
+
+# Build graph again
+g_multi <- graph_from_data_frame(d = edges_multi, vertices = node_df_multi, directed = FALSE)
+
+library(ggraph)
+library(igraph)
+
+# Create layout with node positions
+layout <- create_layout(g_multi, layout = "fr")
+
+# Add driver status to layout
+layout$is_driver <- layout$name %in% driver_genes
+
+# Plot with improved transparency, border, and selective labeling
+ggraph(layout) +
+  geom_edge_link(color = "grey80", alpha = 0.6) +
+  
+  # Circle-shaped filled nodes with stroke outlines
+  geom_node_point(aes(fill = Module, size = is_driver, shape = type),
+                  color = "black", stroke = 0.6, alpha = 0.7) +
+  
+  # Label only driver genes
+  geom_node_text(data = layout %>% filter(is_driver),
+                 aes(label = name),
+                 repel = TRUE, size = 3.5, fontface = "bold", color = "black") +
+  
+  scale_shape_manual(values = c("GO" = 21, "Gene" = 21)) +
+  scale_size_manual(values = c(`FALSE` = 3, `TRUE` = 6)) +
+  scale_fill_manual(values = mod_colors) +
+  theme_void() +
+  ggtitle("Multi-Module GO–Gene Network (Driver Genes Highlighted)")
+
+###########################Final plot#######################
+library(ggraph)
+library(ggrepel)
+library(igraph)
+library(dplyr)
+
+# Step 1: Sanitize the layout metadata
+layout <- layout %>%
+  mutate(
+    Module = as.character(Module),
+    Module = ifelse(is.na(Module), "GO", Module),
+    is_driver = name %in% driver_genes,
+    is_GO = type == "GO",
+    node_shape = case_when(
+      is_GO ~ "GO Term",
+      is_driver ~ "Driver Gene",
+      TRUE ~ "Gene"
+    ),
+    label_x = ifelse(is_GO, x * 1.1, x),
+    label_y = ifelse(is_GO, y * 1.1, y)
+  )
+
+# Step 2: Define your module colors manually
+mod_colors <- c(
+  "ME6"  = "#1b9e77",
+  "ME7"  = "#d95f02",
+  "ME9"  = "#7570b3",
+  "ME12" = "#e7298a",
+  "ME16" = "#66a61e",
+  "GO"   = "#cccccc"
+)
+
+# Ensure Module is a factor
+layout$Module <- factor(layout$Module, levels = names(mod_colors))
+
+# Step 3: Build the plot
+final_plot=ggraph(layout) +
+  geom_edge_link(color = "grey80", alpha = 0.5) +
+  
+  geom_node_point(aes(x = x, y = y, fill = Module, shape = node_shape, size = is_driver),
+                  color = "black", stroke = 0.8, alpha = 0.85) +
+  
+  # Connector lines from GO terms to external labels
+  geom_segment(data = filter(layout, is_GO),
+               aes(x = x, y = y, xend = label_x, yend = label_y),
+               color = "grey50", linetype = "dashed", size = 0.3) +
+  # Driver gene labels
+  geom_label_repel(
+    data = filter(layout, is_driver & !is_GO),
+    aes(x = x, y = y, label = name),
+    size = 4,
+    fontface = "bold",
+    fill="white",
+    color = "darkseagreen",
+    label.size = 0.3,         # thin border
+    label.padding = unit(0.25, "lines"),
+    segment.color = "grey40",
+    segment.size = 0.3,
+    box.padding = 0.5,
+    point.padding = 0.4,
+    force = 4,
+    max.overlaps = Inf,
+  ) + 
+  # GO term labels in whitespace using repel
+  geom_label_repel(
+    data = filter(layout, is_GO),
+    aes(x = x, y = y, label = name),
+    size = 5,
+    fontface = "italic",
+    fill = "white",           # white label box
+    color = "black",          # black text
+    label.size = 0.3,         # thin border
+    label.padding = unit(0.25, "lines"),  # spacing inside box
+    segment.color = "grey40",
+    segment.size = 0.4,
+    box.padding = 0.8,
+    point.padding = 0.3,
+    force = 1,
+    max.overlaps = Inf
+  )+
+  
+  scale_shape_manual(values = c("GO Term" = 22, "Gene" = 21, "Driver Gene" = 24),
+                     name = "Node Type") +
+  scale_fill_manual(values = mod_colors, name = "WGCNA Module", na.translate = FALSE) +
+  scale_size_manual(values = c(`FALSE` = 3.5, `TRUE` = 6), guide = "none") +
+  
+  theme_void() +
+  ggtitle("GO–Gene–Module Network: Driver Genes and Pathways") +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10),
+    legend.key = element_rect(fill = "white"),
+    legend.position = "right"
+  )
+final_plot
+
+ggsave("network_GO_labels_safe.tiff",
+       plot = final_plot,
+       width = 18, height = 15, dpi = 600,
+       bg = "white",
+       limitsize = FALSE)
+
